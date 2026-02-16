@@ -9,6 +9,7 @@ from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web.async_client import AsyncWebClient
+from slackify_markdown import slackify_markdown
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -204,30 +205,34 @@ class SlackChannel(BaseChannel):
             return text
         return re.sub(rf"<@{re.escape(self._bot_user_id)}>\s*", "", text).strip()
 
-    # Markdown → Slack mrkdwn formatting rules (order matters: longest markers first)
-    _MD_TO_SLACK = (
-        (r'(?m)(^|[^\*])\*\*\*(.+?)\*\*\*([^\*]|$)', r'\1*_\2_*\3'),  # ***bold italic***
-        (r'(?m)(^|[^_])___(.+?)___([^_]|$)', r'\1*_\2_*\3'),            # ___bold italic___
-        (r'(?m)(^|[^\*])\*\*(.+?)\*\*([^\*]|$)', r'\1*\2*\3'),          # **bold**
-        (r'(?m)(^|[^_])__(.+?)__([^_]|$)', r'\1*\2*\3'),                # __bold__
-        (r'(?m)(^|[^\*])\*(.+?)\*([^\*]|$)', r'\1_\2_\3'),              # *italic*
-        (r'(?m)(^|[^~])~~(.+?)~~([^~]|$)', r'\1~\2~\3'),                # ~~strike~~
-        (r'(?m)(^|[^!])\[(.+?)\]\((http.+?)\)', r'\1<\3|\2>'),          # [text](url)
-        (r'!\[.+?\]\((http.+?)(?:\s".*?")?\)', r'<\1>'),                # ![alt](url)
-    )
     _TABLE_RE = re.compile(r'(?m)^\|.*?\|$(?:\n(?:\|\:?-{3,}\:?)*?\|$)(?:\n\|.*?\|$)*')
 
-    def _convert_markdown(self, text: str) -> str:
+    @classmethod
+    def _convert_markdown(cls, text: str) -> str:
         """Convert standard Markdown to Slack mrkdwn format."""
         if not text:
             return text
-        for pattern, repl in self._MD_TO_SLACK:
-            text = re.sub(pattern, repl, text)
-        return self._TABLE_RE.sub(self._convert_table, text)
+        # Split around tables so slackify_markdown doesn't mangle them
+        parts: list[str] = []
+        last = 0
+        for m in cls._TABLE_RE.finditer(text):
+            chunk = text[last:m.start()]
+            if chunk:
+                parts.append(slackify_markdown(chunk).rstrip('\n') + '\n')
+            parts.append(cls._convert_table(m))
+            last = m.end()
+        tail = text[last:]
+        if tail:
+            converted = slackify_markdown(tail)
+            if tail.startswith('\n'):
+                converted = '\n' + converted.lstrip('\n')
+            parts.append(converted)
+        return ''.join(parts)
 
     @staticmethod
     def _convert_table(match: re.Match) -> str:
         """Convert Markdown table to Slack quote + bullet format."""
+        _s = lambda v: slackify_markdown(v).strip() if v else v
         lines = [l.strip() for l in match.group(0).strip().split('\n') if l.strip()]
         if len(lines) < 2:
             return match.group(0)
@@ -241,9 +246,9 @@ class SlackChannel(BaseChannel):
             cells = (cells + [''] * len(headers))[:len(headers)]
             if not any(cells):
                 continue
-            result.append(f"> *{headers[0]}*: {cells[0] or '--'}")
+            result.append(f"> *{_s(headers[0])}*: {_s(cells[0]) or '--'}")
             for i, cell in enumerate(cells[1:], 1):
                 if cell and i < len(headers):
-                    result.append(f"  \u2022 *{headers[i]}*: {cell}")
+                    result.append(f"  \u2022 *{_s(headers[i])}*: {_s(cell)}")
             result.append("")
         return '\n'.join(result).rstrip()
