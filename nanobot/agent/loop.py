@@ -250,11 +250,14 @@ class AgentLoop:
         """Enable MLflow tracing if MLFLOW_TRACKING_URI is set.
 
         Calls mlflow.dspy.autolog() so every dspy.LM call is automatically
-        traced and recorded as an MLflow experiment run.
+        traced.  Each conversation turn is wrapped in its own
+        ``mlflow.start_span()`` context so that traces are scoped per
+        turn rather than per process lifetime.
         """
         import os
         tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
         if not tracking_uri:
+            self._mlflow = None
             return
 
         try:
@@ -263,11 +266,14 @@ class AgentLoop:
             mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment("nanobot")
             mlflow.dspy.autolog()
+            self._mlflow = mlflow
 
             logger.info(f"MLflow tracing enabled → {tracking_uri}")
         except ImportError:
+            self._mlflow = None
             logger.debug("mlflow not installed, skipping tracing setup")
         except Exception as e:
+            self._mlflow = None
             logger.warning(f"Failed to initialise MLflow tracing: {e}")
 
     async def _connect_mcp(self) -> None:
@@ -544,7 +550,19 @@ class AgentLoop:
         try:
             import dspy
             with dspy.track_usage() as tracker:
-                final_content, tools_used = await self._run_agent_loop(initial_messages)
+                if self._mlflow:
+                    with self._mlflow.start_span(
+                        name="agent_turn",
+                        attributes={
+                            "channel": msg.channel,
+                            "chat_id": msg.chat_id,
+                            "sender": msg.sender_id,
+                            "message_preview": msg.content[:120],
+                        },
+                    ):
+                        final_content, tools_used = await self._run_agent_loop(initial_messages)
+                else:
+                    final_content, tools_used = await self._run_agent_loop(initial_messages)
             usage_totals = tracker.get_total_tokens()
         except ImportError:
             final_content, tools_used = await self._run_agent_loop(initial_messages)
