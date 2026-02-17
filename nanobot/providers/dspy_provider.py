@@ -3,6 +3,7 @@
 from typing import Any
 
 import json_repair
+import litellm
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -13,10 +14,10 @@ class DSPyProvider(LLMProvider):
 
     Provides the same interface as LiteLLMProvider but routes calls through
     DSPy's LM abstraction, gaining:
-    - Automatic response caching (deduplicates identical requests)
+    - Automatic MLflow tracing via mlflow.dspy.autolog()
     - Retry with exponential backoff
-    - Call history for observability (Phase 2 callbacks)
-    - Foundation for dspy.Predict / dspy.ReAct integration (Phase 4)
+    - Call history for observability
+    - Foundation for dspy.Predict / dspy.ReAct integration
 
     Under the hood dspy.LM still uses litellm, so model naming, API keys,
     and fallback chains work identically.
@@ -35,22 +36,43 @@ class DSPyProvider(LLMProvider):
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        self._cache = cache
+        self._num_retries = num_retries
 
+        # Configure litellm globals (same as LiteLLMProvider)
+        if api_base:
+            litellm.api_base = api_base
+        litellm.suppress_debug_info = True
+        litellm.drop_params = True
+
+        import dspy
+
+        self._lm = self._make_lm(default_model, temperature, max_tokens)
+        # Cache dspy.LM instances by model name for tier switching
+        self._lm_cache: dict[str, Any] = {default_model: self._lm}
+
+    def _make_lm(self, model: str, temperature: float, max_tokens: int) -> Any:
+        """Create a dspy.LM instance."""
         import dspy
 
         lm_kwargs: dict[str, Any] = {
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "cache": cache,
-            "num_retries": num_retries,
+            "cache": self._cache,
+            "num_retries": self._num_retries,
         }
-        if api_key:
-            lm_kwargs["api_key"] = api_key
-        if api_base:
-            lm_kwargs["api_base"] = api_base
-        lm_kwargs.update(extra_kwargs)
+        if self.api_key:
+            lm_kwargs["api_key"] = self.api_key
+        if self.api_base:
+            lm_kwargs["api_base"] = self.api_base
+        return dspy.LM(model=model, **lm_kwargs)
 
-        self._lm = dspy.LM(model=default_model, **lm_kwargs)
+    def _get_lm(self, model: str | None, temperature: float, max_tokens: int) -> Any:
+        """Get or create a dspy.LM for the given model."""
+        model = model or self.default_model
+        if model not in self._lm_cache:
+            self._lm_cache[model] = self._make_lm(model, temperature, max_tokens)
+        return self._lm_cache[model]
 
     @property
     def lm(self) -> Any:
@@ -71,6 +93,8 @@ class DSPyProvider(LLMProvider):
         Uses dspy's native async path (alitellm_completion) so the event
         loop is never blocked.
         """
+        lm = self._get_lm(model, temperature, max_tokens)
+
         kwargs: dict[str, Any] = {
             "temperature": temperature,
             "max_tokens": max(1, max_tokens),
@@ -80,11 +104,11 @@ class DSPyProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
 
         try:
-            await self._lm.acall(messages=messages, **kwargs)
+            await lm.acall(messages=messages, **kwargs)
 
             # dspy.LM stores the full litellm response in history
-            if self._lm.history:
-                entry = self._lm.history[-1]
+            if lm.history:
+                entry = lm.history[-1]
                 response = entry.get("response") or entry.get("outputs")
                 if response and hasattr(response, "choices"):
                     return self._parse_response(response)

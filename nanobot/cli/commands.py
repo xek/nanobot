@@ -280,8 +280,11 @@ This file stores important information that should persist across sessions.
 
 
 def _make_provider(config: Config):
-    """Create LiteLLMProvider from config. Exits if no API key found."""
-    from nanobot.providers.litellm_provider import LiteLLMProvider
+    """Create an LLM provider from config.
+
+    Prefers DSPyProvider (routes calls through dspy.LM for tracing &
+    caching). Falls back to LiteLLMProvider if dspy is not installed.
+    """
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
     model = config.agents.defaults.model
@@ -299,9 +302,27 @@ def _make_provider(config: Config):
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
+    api_key = p.api_key if p else None
+    api_base = config.get_api_base(model)
+
+    # Try DSPyProvider first — enables mlflow.dspy.autolog() tracing
+    try:
+        from nanobot.providers.dspy_provider import DSPyProvider
+        return DSPyProvider(
+            api_key=api_key,
+            api_base=api_base,
+            default_model=model,
+            temperature=config.agents.defaults.temperature,
+            max_tokens=config.agents.defaults.max_tokens,
+            cache=False,
+        )
+    except ImportError:
+        pass
+
+    from nanobot.providers.litellm_provider import LiteLLMProvider
     return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
+        api_key=api_key,
+        api_base=api_base,
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,

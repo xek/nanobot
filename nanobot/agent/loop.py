@@ -93,6 +93,9 @@ class AgentLoop:
         # Falls back gracefully if dspy is not installed.
         self.lm_quick, self.lm_normal, self.lm_deep = self._init_dspy_tiers()
 
+        # Enable MLflow tracing if MLFLOW_TRACKING_URI is set
+        self._init_mlflow_tracing()
+
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -189,6 +192,30 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to initialise dspy.LM tiers: {e}")
             return None, None, None
+
+    def _init_mlflow_tracing(self) -> None:
+        """Enable MLflow tracing if MLFLOW_TRACKING_URI is set.
+
+        Calls mlflow.dspy.autolog() so every dspy.LM call is automatically
+        traced and recorded as an MLflow experiment run.
+        """
+        import os
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+        if not tracking_uri:
+            return
+
+        try:
+            import mlflow
+
+            mlflow.set_tracking_uri(tracking_uri)
+            mlflow.set_experiment("nanobot")
+            mlflow.dspy.autolog()
+
+            logger.info(f"MLflow tracing enabled → {tracking_uri}")
+        except ImportError:
+            logger.debug("mlflow not installed, skipping tracing setup")
+        except Exception as e:
+            logger.warning(f"Failed to initialise MLflow tracing: {e}")
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
