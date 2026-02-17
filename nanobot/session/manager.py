@@ -18,9 +18,10 @@ class Session:
 
     Stores messages in JSONL format for easy reading and persistence.
 
-    Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    Between compactions messages are append-only so the LLM prefix
+    cache stays valid.  When consolidation fires, old messages are
+    summarised into MEMORY.md / HISTORY.md and then trimmed via
+    ``trim()``, resetting the cache prefix.
     """
 
     key: str  # channel:chat_id
@@ -45,6 +46,27 @@ class Session:
         """Get recent messages in LLM format (role + content only)."""
         return [{"role": m["role"], "content": m["content"]} for m in self.messages[-max_messages:]]
     
+    def trim(self, keep: int) -> int:
+        """Discard all but the last *keep* messages.
+
+        Called after consolidation so that summarised messages no longer
+        occupy the LLM prompt.  Resets ``last_consolidated`` to 0.
+        The LLM prefix cache is expected to reset at this point.
+
+        Returns the number of messages removed.
+        """
+        if keep <= 0:
+            removed = len(self.messages)
+            self.messages = []
+        elif len(self.messages) > keep:
+            removed = len(self.messages) - keep
+            self.messages = self.messages[-keep:]
+        else:
+            return 0
+        self.last_consolidated = 0
+        self.updated_at = datetime.now()
+        return removed
+
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []

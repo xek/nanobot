@@ -24,11 +24,14 @@ from nanobot.agent.tools.registry import ToolRegistry
 class AgentTurn(dspy.Signature):
     """You are a helpful AI assistant with access to tools.
     Respond concisely and accurately. Use tools when you need
-    external information or to take action."""
+    external information or to take action.
+    Focus on the current user message. History is provided only for
+    short-term continuity — do NOT blend unrelated earlier topics
+    into your answer unless the user explicitly refers to them."""
 
     message: str = dspy.InputField(desc="Current user message")
     history: dspy.History = dspy.InputField(
-        desc="Conversation history", default=None,
+        desc="Recent conversation turns for short-term continuity", default=None,
     )
     response: str = dspy.OutputField(desc="Response to the user")
 

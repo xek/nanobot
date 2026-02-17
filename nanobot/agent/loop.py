@@ -620,9 +620,14 @@ class AgentLoop:
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
         """Consolidate old messages into MEMORY.md + HISTORY.md.
 
+        After successful summarisation the session is trimmed to
+        ``keep_count`` recent messages and saved.  The LLM prefix
+        cache resets at this point; between compactions messages
+        remain append-only for cache efficiency.
+
         Args:
             archive_all: If True, clear all messages and reset session (for /new command).
-                       If False, only write to files without modifying session.
+                       If False, summarise old messages then trim the session.
         """
         memory = MemoryStore(self.workspace)
 
@@ -697,8 +702,12 @@ Respond with ONLY valid JSON, no markdown fences."""
             if archive_all:
                 session.last_consolidated = 0
             else:
-                session.last_consolidated = len(session.messages) - keep_count
-            logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
+                removed = session.trim(keep_count)
+                self.sessions.save(session)
+                logger.info(
+                    f"Memory consolidation done: trimmed {removed} messages, "
+                    f"{len(session.messages)} remaining"
+                )
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
 

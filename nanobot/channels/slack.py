@@ -82,10 +82,12 @@ class SlackChannel(BaseChannel):
             slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
             thread_ts = slack_meta.get("thread_ts")
             channel_type = slack_meta.get("channel_type")
+            # Use original channel ID (chat_id may contain thread suffix)
+            channel_id = slack_meta.get("channel_id") or msg.chat_id.split(":")[0]
             # Only reply in thread for channel/group messages; DMs don't use threads
             use_thread = thread_ts and channel_type != "im"
             await self._web_client.chat_postMessage(
-                channel=msg.chat_id,
+                channel=channel_id,
                 text=self._to_mrkdwn(msg.content),
                 thread_ts=thread_ts if use_thread else None,
             )
@@ -153,6 +155,15 @@ class SlackChannel(BaseChannel):
         text = self._strip_bot_mention(text)
 
         thread_ts = event.get("thread_ts") or event.get("ts")
+
+        # For group/channel messages, scope sessions by thread so
+        # different conversations in the same channel don't mix.
+        # DMs already have a unique channel per user.
+        if channel_type != "im" and thread_ts:
+            effective_chat_id = f"{chat_id}:{thread_ts}"
+        else:
+            effective_chat_id = chat_id
+
         # Add :eyes: reaction to the triggering message (best-effort)
         try:
             if self._web_client and event.get("ts"):
@@ -166,13 +177,14 @@ class SlackChannel(BaseChannel):
 
         await self._handle_message(
             sender_id=sender_id,
-            chat_id=chat_id,
+            chat_id=effective_chat_id,
             content=text,
             metadata={
                 "slack": {
                     "event": event,
                     "thread_ts": thread_ts,
                     "channel_type": channel_type,
+                    "channel_id": chat_id,  # original channel for replies
                 }
             },
         )
