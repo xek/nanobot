@@ -170,6 +170,15 @@ class AgentLoop:
             logger.debug("No tier models configured, skipping dspy.LM init")
             return None, None, None
 
+        # Resolve model names through the provider's gateway logic so that
+        # e.g. "gemini/gemini-3-flash" becomes "openai/gemini-3-flash" when
+        # routed through a LiteLLM proxy.
+        resolve = getattr(self.provider, "_resolve_model", None)
+        if resolve:
+            q_model = resolve(q_model)
+            n_model = resolve(n_model)
+            d_model = resolve(d_model)
+
         try:
             lm_quick = dspy.LM(
                 q_model, temperature=q_temp, max_tokens=q_max,

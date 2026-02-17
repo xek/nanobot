@@ -315,6 +315,7 @@ def _make_provider(config: Config):
             temperature=config.agents.defaults.temperature,
             max_tokens=config.agents.defaults.max_tokens,
             cache=False,
+            provider_name=provider_name,
         )
     except ImportError:
         pass

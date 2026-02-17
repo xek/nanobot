@@ -6,6 +6,7 @@ import json_repair
 import litellm
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.registry import find_by_model, find_gateway
 
 
 class DSPyProvider(LLMProvider):
@@ -32,12 +33,16 @@ class DSPyProvider(LLMProvider):
         max_tokens: int = 4096,
         cache: bool = False,
         num_retries: int = 3,
+        provider_name: str | None = None,
         **extra_kwargs: Any,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self._cache = cache
         self._num_retries = num_retries
+
+        # Detect gateway (LiteLLM proxy, OpenRouter, etc.)
+        self._gateway = find_gateway(provider_name, api_key, api_base)
 
         # Configure litellm globals (same as LiteLLMProvider)
         if api_base:
@@ -47,12 +52,33 @@ class DSPyProvider(LLMProvider):
 
         import dspy
 
-        self._lm = self._make_lm(default_model, temperature, max_tokens)
-        # Cache dspy.LM instances by model name for tier switching
+        resolved = self._resolve_model(default_model)
+        self._lm = self._make_lm(resolved, temperature, max_tokens)
+        # Cache dspy.LM instances by *original* model name for tier switching
         self._lm_cache: dict[str, Any] = {default_model: self._lm}
 
+    def _resolve_model(self, model: str) -> str:
+        """Resolve model name by applying gateway/provider prefixes.
+
+        Mirrors LiteLLMProvider._resolve_model so that models routed through
+        a LiteLLM proxy get the correct ``openai/`` prefix.
+        """
+        if self._gateway:
+            prefix = self._gateway.litellm_prefix
+            if self._gateway.strip_model_prefix:
+                model = model.split("/")[-1]
+            if prefix and not model.startswith(f"{prefix}/"):
+                model = f"{prefix}/{model}"
+            return model
+
+        spec = find_by_model(model)
+        if spec and spec.litellm_prefix:
+            if not any(model.startswith(s) for s in spec.skip_prefixes):
+                model = f"{spec.litellm_prefix}/{model}"
+        return model
+
     def _make_lm(self, model: str, temperature: float, max_tokens: int) -> Any:
-        """Create a dspy.LM instance."""
+        """Create a dspy.LM instance with an already-resolved model name."""
         import dspy
 
         lm_kwargs: dict[str, Any] = {
@@ -71,7 +97,8 @@ class DSPyProvider(LLMProvider):
         """Get or create a dspy.LM for the given model."""
         model = model or self.default_model
         if model not in self._lm_cache:
-            self._lm_cache[model] = self._make_lm(model, temperature, max_tokens)
+            resolved = self._resolve_model(model)
+            self._lm_cache[model] = self._make_lm(resolved, temperature, max_tokens)
         return self._lm_cache[model]
 
     @property

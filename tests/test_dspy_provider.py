@@ -189,6 +189,7 @@ class TestAgentLoopDspyTiers:
         mock_provider.api_key = "sk-test"
         mock_provider.api_base = "http://localhost:4000"
         mock_provider.get_default_model.return_value = "base/default-model"
+        mock_provider._resolve_model = lambda m: m  # no gateway in tests
 
         mock_bus = MagicMock()
         mock_bus.publish_outbound = AsyncMock()
