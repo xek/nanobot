@@ -155,6 +155,20 @@ class ChannelsConfig(BaseModel):
     qq: QQConfig = Field(default_factory=QQConfig)
 
 
+class TierConfig(BaseModel):
+    """Configuration for a single LLM tier."""
+    model: str = ""
+    temperature: float | None = None  # None = inherit from AgentDefaults
+    max_tokens: int | None = None  # None = inherit from AgentDefaults
+
+
+class TiersConfig(BaseModel):
+    """LLM tier configuration for quick / normal / deep model selection."""
+    quick: TierConfig = Field(default_factory=TierConfig)
+    normal: TierConfig = Field(default_factory=TierConfig)
+    deep: TierConfig = Field(default_factory=TierConfig)
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
@@ -163,6 +177,25 @@ class AgentDefaults(BaseModel):
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
+    tiers: TiersConfig = Field(default_factory=TiersConfig)
+
+    def resolve_tier(self, tier: str | None) -> tuple[str, float, int]:
+        """Resolve a tier name to (model, temperature, max_tokens).
+
+        Falls back to the top-level defaults for any unset field.
+        If tier is None or not recognized, returns the top-level defaults
+        (equivalent to "normal").
+        """
+        tier_cfg: TierConfig | None = None
+        if tier in ("quick", "normal", "deep"):
+            tier_cfg = getattr(self.tiers, tier)
+        if tier_cfg and tier_cfg.model:
+            return (
+                tier_cfg.model,
+                tier_cfg.temperature if tier_cfg.temperature is not None else self.temperature,
+                tier_cfg.max_tokens if tier_cfg.max_tokens is not None else self.max_tokens,
+            )
+        return self.model, self.temperature, self.max_tokens
 
 
 class AgentsConfig(BaseModel):
