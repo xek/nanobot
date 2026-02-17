@@ -48,7 +48,9 @@ class ThinkTool(Tool):
             "Delegate a subtask to a different thinking mode. "
             "'quick' = fast/cheap inline call for simple subtasks (classification, reformatting, yes/no). "
             "'deep' = powerful inline call for hard problems or self-reflection. "
-            "'background' = spawn a full subagent with tools that runs asynchronously and reports back."
+            "'background' = spawn a full subagent with tools that runs asynchronously and reports back. "
+            "IMPORTANT: For quick/deep modes, the LLM only sees 'prompt' and 'context'. "
+            "You MUST paste any relevant data (tool outputs, file contents, etc.) into the 'context' field."
         )
 
     @property
@@ -59,6 +61,14 @@ class ThinkTool(Tool):
                 "prompt": {
                     "type": "string",
                     "description": "The task or question to think about",
+                },
+                "context": {
+                    "type": "string",
+                    "description": (
+                        "Data the LLM needs to answer the prompt (e.g. page content, "
+                        "file contents, previous tool output). Required for quick/deep — "
+                        "the inline LLM has NO access to conversation history or tools."
+                    ),
                 },
                 "mode": {
                     "type": "string",
@@ -78,13 +88,19 @@ class ThinkTool(Tool):
         }
 
     async def execute(
-        self, prompt: str, mode: str = "quick", label: str | None = None, **kwargs: Any,
+        self,
+        prompt: str,
+        mode: str = "quick",
+        context: str | None = None,
+        label: str | None = None,
+        **kwargs: Any,
     ) -> str:
         if mode == "background":
-            return await self._run_background(prompt, label)
-        return await self._run_inline(prompt, mode)
+            full_task = f"{prompt}\n\nContext:\n{context}" if context else prompt
+            return await self._run_background(full_task, label)
+        return await self._run_inline(prompt, context, mode)
 
-    async def _run_inline(self, prompt: str, mode: str) -> str:
+    async def _run_inline(self, prompt: str, context: str | None, mode: str) -> str:
         """Single dspy.Predict call on the chosen tier."""
         import dspy
 
@@ -94,7 +110,12 @@ class ThinkTool(Tool):
 
         try:
             with dspy.context(lm=lm):
-                result = dspy.Predict("prompt -> result")(prompt=prompt)
+                if context:
+                    result = dspy.Predict("context, prompt -> result")(
+                        context=context, prompt=prompt,
+                    )
+                else:
+                    result = dspy.Predict("prompt -> result")(prompt=prompt)
             return result.result
         except Exception as e:
             return f"Error in think({mode}): {e}"

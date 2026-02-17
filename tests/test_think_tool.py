@@ -53,6 +53,7 @@ def test_parameters_schema(full_tool):
     params = full_tool.parameters
     props = params["properties"]
     assert "prompt" in props
+    assert "context" in props
     assert "mode" in props
     assert "label" in props
     assert params["required"] == ["prompt", "mode"]
@@ -76,6 +77,8 @@ async def test_inline_quick(full_tool, lm_quick):
 
     assert result == "42"
     ctx_mock.assert_called_once_with(lm=lm_quick)
+    # Without context, should use "prompt -> result" signature
+    predict_cls.assert_called_once_with("prompt -> result")
 
 
 @pytest.mark.asyncio
@@ -93,6 +96,46 @@ async def test_inline_deep(full_tool, lm_deep):
 
     assert result == "deep answer"
     ctx_mock.assert_called_once_with(lm=lm_deep)
+
+
+@pytest.mark.asyncio
+async def test_inline_with_context(full_tool, lm_quick):
+    """When context is provided, the LLM gets a 'context, prompt -> result' signature."""
+    mock_result = MagicMock()
+    mock_result.result = "The page describes a 6-level hierarchy."
+
+    with patch("dspy.context") as ctx_mock, \
+         patch("dspy.Predict") as predict_cls:
+        ctx_mock.return_value.__enter__ = MagicMock()
+        ctx_mock.return_value.__exit__ = MagicMock(return_value=False)
+        predict_cls.return_value.return_value = mock_result
+
+        result = await full_tool.execute(
+            prompt="Summarize the Jira methodology",
+            context="Level 6: Strategic Goal\nLevel 5: Outcome\nLevel 4: Feature",
+            mode="quick",
+        )
+
+    assert result == "The page describes a 6-level hierarchy."
+    predict_cls.assert_called_once_with("context, prompt -> result")
+    predict_cls.return_value.assert_called_once_with(
+        context="Level 6: Strategic Goal\nLevel 5: Outcome\nLevel 4: Feature",
+        prompt="Summarize the Jira methodology",
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_with_context(full_tool, subagent_manager):
+    """Context is appended to the task for background mode."""
+    await full_tool.execute(
+        prompt="Analyze this data",
+        context="some data here",
+        mode="background",
+        label="analysis",
+    )
+    call_args = subagent_manager.spawn.call_args
+    assert "Analyze this data" in call_args.kwargs["task"]
+    assert "some data here" in call_args.kwargs["task"]
 
 
 @pytest.mark.asyncio

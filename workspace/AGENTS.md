@@ -25,6 +25,12 @@ access to other modes:
   time-consuming tasks that can run independently of the current
   conversation.
 
+**Critical**: For quick/deep modes, the inline LLM has NO access to
+your conversation, history, or tools. You MUST paste any relevant
+data into the `context` parameter. For example, if you fetched a
+page and want to summarize it with `quick`, pass the page content
+as `context`.
+
 You don't need to call `think` for normal work -- just respond as
 usual. Only escalate to deep when normal isn't working, delegate
 to quick when the subtask is trivial, and use background for tasks
