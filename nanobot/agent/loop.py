@@ -18,8 +18,8 @@ from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFile
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.think import ThinkTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
@@ -106,6 +106,13 @@ class AgentLoop:
         self._mcp_connected = False
         self._react_agent: Any = None  # Lazy-initialised after MCP connect
         self._register_default_tools()
+
+        # Think tool — inline tier calls + background subagents
+        self.tools.register(ThinkTool(
+            lm_quick=self.lm_quick,
+            lm_deep=self.lm_deep,
+            subagent_manager=self.subagents,
+        ))
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -130,11 +137,7 @@ class AgentLoop:
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
         self.tools.register(message_tool)
-        
-        # Spawn tool (for subagents)
-        spawn_tool = SpawnTool(manager=self.subagents)
-        self.tools.register(spawn_tool)
-        
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -292,9 +295,9 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.set_context(channel, chat_id)
 
-        if spawn_tool := self.tools.get("spawn"):
-            if isinstance(spawn_tool, SpawnTool):
-                spawn_tool.set_context(channel, chat_id)
+        if think_tool := self.tools.get("think"):
+            if isinstance(think_tool, ThinkTool):
+                think_tool.set_context(channel, chat_id)
 
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
@@ -677,12 +680,18 @@ class AgentLoop:
 Respond with ONLY valid JSON, no markdown fences."""
 
         try:
+            # Use the quick tier for consolidation (routine summarisation)
+            consolidation_model = self.model
+            if self.lm_quick:
+                q_model, _, _ = self.agent_defaults.resolve_tier("quick")
+                consolidation_model = q_model
+
             response = await self.provider.chat(
                 messages=[
                     {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
                     {"role": "user", "content": prompt},
                 ],
-                model=self.model,
+                model=consolidation_model,
             )
             text = (response.content or "").strip()
             if not text:
