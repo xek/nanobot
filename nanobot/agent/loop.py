@@ -104,6 +104,7 @@ class AgentLoop:
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
+        self._react_agent: Any = None  # Lazy-initialised after MCP connect
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -293,9 +294,34 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
+    def _init_react_agent(self) -> Any:
+        """Create the NanobotReAct module (lazy, called after MCP connect).
+
+        Returns the module, or None if dspy is unavailable.
+        """
+        try:
+            import dspy
+            from nanobot.agent.dspy_agent import NanobotReAct, wrap_registry
+        except ImportError:
+            logger.debug("dspy not installed, falling back to manual agent loop")
+            return None
+
+        dspy_tools = wrap_registry(self.tools)
+        instructions = self.context.build_system_prompt()
+        agent = NanobotReAct(
+            tools=dspy_tools,
+            max_iters=self.max_iterations,
+            instructions=instructions,
+        )
+        logger.info(f"NanobotReAct initialised with {len(dspy_tools)} tools")
+        return agent
+
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
+
+        If a NanobotReAct module is available, delegates to it.
+        Otherwise falls back to the manual provider.chat() loop.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
@@ -303,6 +329,71 @@ class AgentLoop:
         Returns:
             Tuple of (final_content, list_of_tools_used).
         """
+        # Try ReAct path
+        if self._react_agent is not None:
+            return await self._run_react_loop(initial_messages)
+
+        # Fallback: manual tool-calling loop
+        return await self._run_manual_loop(initial_messages)
+
+    async def _run_react_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+        """Run the agent turn via dspy.ReAct."""
+        from nanobot.agent.dspy_agent import build_history
+
+        # Extract the current user message (last user message)
+        current_message = ""
+        for msg in reversed(initial_messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    current_message = content
+                elif isinstance(content, list):
+                    # Multi-modal: extract text parts
+                    current_message = " ".join(
+                        p.get("text", "") for p in content if p.get("type") == "text"
+                    )
+                break
+
+        # Build history from prior messages (skip system and current user)
+        history_msgs = [
+            m for m in initial_messages
+            if m.get("role") in ("user", "assistant")
+        ]
+        # Remove the last user message (it's the current turn)
+        if history_msgs and history_msgs[-1].get("role") == "user":
+            history_msgs = history_msgs[:-1]
+
+        history = build_history(history_msgs) if history_msgs else None
+
+        try:
+            prediction = await self._react_agent.acall(
+                message=current_message,
+                history=history,
+            )
+        except Exception as e:
+            logger.error(f"ReAct agent failed: {e}")
+            return f"I encountered an error processing your request: {e}", []
+
+        # Extract tools used from the trajectory
+        tools_used: list[str] = []
+        trajectory = getattr(prediction, "trajectory", {}) or {}
+        for key, val in trajectory.items():
+            if key.startswith("tool_name_") and val and val != "finish":
+                tools_used.append(val)
+
+        # Log tool calls from trajectory
+        for key, val in sorted(trajectory.items()):
+            if key.startswith("tool_name_") and val and val != "finish":
+                idx = key.split("_")[-1]
+                args = trajectory.get(f"tool_args_{idx}", {})
+                args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                logger.info(f"Tool call: {val}({args_str[:200]})")
+
+        response_text = getattr(prediction, "response", None) or ""
+        return response_text, tools_used
+
+    async def _run_manual_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+        """Fallback: manual tool-calling loop via provider.chat()."""
         messages = initial_messages
         iteration = 0
         final_content = None
@@ -355,6 +446,9 @@ class AgentLoop:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
         await self._connect_mcp()
+        # Initialise ReAct after MCP so all tools (including MCP) are available
+        if self._react_agent is None:
+            self._react_agent = self._init_react_agent()
         logger.info("Agent loop started")
 
         while self._running:
@@ -640,6 +734,8 @@ Respond with ONLY valid JSON, no markdown fences."""
 
         try:
             await self._connect_mcp()
+            if self._react_agent is None:
+                self._react_agent = self._init_react_agent()
             msg = InboundMessage(
                 channel=channel,
                 sender_id="user",
