@@ -61,6 +61,11 @@ class CronTool(Tool):
                 "job_id": {
                     "type": "string",
                     "description": "Job ID (for remove)"
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["quick", "normal", "deep"],
+                    "description": "LLM tier for this job. quick=fast/cheap (weather, reminders), normal=default, deep=complex analysis. Defaults to quick."
                 }
             },
             "required": ["action"]
@@ -75,10 +80,11 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        tier: str | None = None,
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(message, every_seconds, cron_expr, tz, at, tier=tier)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -92,6 +98,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        tier: str | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -121,6 +128,8 @@ class CronTool(Tool):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
         
+        effective_tier = tier if tier in ("quick", "normal", "deep") else None
+        
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
@@ -129,14 +138,19 @@ class CronTool(Tool):
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
+            tier=effective_tier,
         )
-        return f"Created job '{job.name}' (id: {job.id})"
+        tier_label = f", tier: {effective_tier}" if effective_tier else ""
+        return f"Created job '{job.name}' (id: {job.id}{tier_label})"
     
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()
         if not jobs:
             return "No scheduled jobs."
-        lines = [f"- {j.name} (id: {j.id}, {j.schedule.kind})" for j in jobs]
+        lines = []
+        for j in jobs:
+            tier_info = f", tier: {j.payload.tier}" if j.payload.tier else ""
+            lines.append(f"- {j.name} (id: {j.id}, {j.schedule.kind}{tier_info})")
         return "Scheduled jobs:\n" + "\n".join(lines)
     
     def _remove_job(self, job_id: str | None) -> str:

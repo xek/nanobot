@@ -27,6 +27,8 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    # LLM tier override: "quick", "normal", "deep", or None for default
+    tier: str | None = None
 
 
 @dataclass
