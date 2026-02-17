@@ -301,102 +301,103 @@ class AgentLoop:
                 cron_tool.set_context(channel, chat_id)
 
     def _init_react_agent(self) -> Any:
-        """Create the NanobotReAct module (lazy, called after MCP connect).
+        """Create the dspy.ReAct module (lazy, called after MCP connect).
 
         Returns the module, or None if dspy is unavailable.
         """
         try:
             import dspy
-            from nanobot.agent.dspy_agent import NanobotReAct, wrap_registry
+            from nanobot.agent.dspy_agent import AgentTurn, wrap_registry
         except ImportError:
             logger.debug("dspy not installed, falling back to manual agent loop")
             return None
 
         dspy_tools = wrap_registry(self.tools)
         instructions = self.context.build_system_prompt()
-        agent = NanobotReAct(
-            tools=dspy_tools,
-            max_iters=self.max_iterations,
-            instructions=instructions,
-        )
-        logger.info(f"NanobotReAct initialised with {len(dspy_tools)} tools")
+        sig = AgentTurn
+        if instructions:
+            sig = sig.with_instructions(f"{AgentTurn.__doc__}\n\n{instructions}")
+        agent = dspy.ReAct(sig, tools=dspy_tools, max_iters=self.max_iterations)
+        logger.info(f"dspy.ReAct initialised with {len(dspy_tools)} tools")
         return agent
 
+    async def _traced_agent_loop(
+        self, initial_messages: list[dict], msg: InboundMessage,
+    ) -> tuple[str | None, list[str], dict[str, dict]]:
+        """Run the agent loop with optional DSPy usage tracking and MLflow span."""
+        usage_totals: dict[str, dict] = {}
+
+        try:
+            import dspy
+        except ImportError:
+            content, tools = await self._run_agent_loop(initial_messages)
+            return content, tools, usage_totals
+
+        with dspy.track_usage() as tracker:
+            if self._mlflow:
+                with self._mlflow.start_span(
+                    name="agent_turn",
+                    attributes={
+                        "channel": msg.channel,
+                        "chat_id": msg.chat_id,
+                        "sender": msg.sender_id,
+                        "message_preview": msg.content[:120],
+                    },
+                ):
+                    content, tools = await self._run_agent_loop(initial_messages)
+            else:
+                content, tools = await self._run_agent_loop(initial_messages)
+        usage_totals = tracker.get_total_tokens()
+        return content, tools, usage_totals
+
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
-        """
-        Run the agent iteration loop.
-
-        If a NanobotReAct module is available, delegates to it.
-        Otherwise falls back to the manual provider.chat() loop.
-
-        Args:
-            initial_messages: Starting messages for the LLM conversation.
-
-        Returns:
-            Tuple of (final_content, list_of_tools_used).
-        """
-        # Try ReAct path
+        """Dispatch to dspy.ReAct or the manual tool-calling loop."""
         if self._react_agent is not None:
             return await self._run_react_loop(initial_messages)
-
-        # Fallback: manual tool-calling loop
         return await self._run_manual_loop(initial_messages)
 
     async def _run_react_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
-        """Run the agent turn via dspy.ReAct."""
+        """Run the agent turn via dspy.ReAct.acall()."""
         from nanobot.agent.dspy_agent import build_history
 
-        # Extract the current user message (last user message)
+        # Extract current user message (last user turn)
         current_message = ""
-        for msg in reversed(initial_messages):
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    current_message = content
-                elif isinstance(content, list):
-                    # Multi-modal: extract text parts
-                    current_message = " ".join(
-                        p.get("text", "") for p in content if p.get("type") == "text"
-                    )
+        for m in reversed(initial_messages):
+            if m.get("role") == "user":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    c = " ".join(p.get("text", "") for p in c if p.get("type") == "text")
+                current_message = c
                 break
 
-        # Build history from prior messages (skip system and current user)
-        history_msgs = [
-            m for m in initial_messages
-            if m.get("role") in ("user", "assistant")
-        ]
-        # Remove the last user message (it's the current turn)
+        # Build history from prior user/assistant pairs (exclude current turn)
+        history_msgs = [m for m in initial_messages if m.get("role") in ("user", "assistant")]
         if history_msgs and history_msgs[-1].get("role") == "user":
             history_msgs = history_msgs[:-1]
-
         history = build_history(history_msgs) if history_msgs else None
 
+        kwargs: dict[str, Any] = {"message": current_message}
+        if history is not None:
+            kwargs["history"] = history
+
         try:
-            prediction = await self._react_agent.acall(
-                message=current_message,
-                history=history,
-            )
+            prediction = await self._react_agent.acall(**kwargs)
         except Exception as e:
             logger.error(f"ReAct agent failed: {e}")
             return f"I encountered an error processing your request: {e}", []
 
-        # Extract tools used from the trajectory
-        tools_used: list[str] = []
+        # Extract tool names from the trajectory
         trajectory = getattr(prediction, "trajectory", {}) or {}
-        for key, val in trajectory.items():
-            if key.startswith("tool_name_") and val and val != "finish":
-                tools_used.append(val)
-
-        # Log tool calls from trajectory
+        tools_used: list[str] = []
         for key, val in sorted(trajectory.items()):
             if key.startswith("tool_name_") and val and val != "finish":
+                tools_used.append(val)
                 idx = key.split("_")[-1]
                 args = trajectory.get(f"tool_args_{idx}", {})
                 args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
                 logger.info(f"Tool call: {val}({args_str[:200]})")
 
-        response_text = getattr(prediction, "response", None) or ""
-        return response_text, tools_used
+        return getattr(prediction, "response", None) or "", tools_used
 
     async def _run_manual_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """Fallback: manual tool-calling loop via provider.chat()."""
@@ -545,27 +546,10 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
 
-        # Track token usage per model for this turn
-        usage_totals: dict[str, dict] = {}
-        try:
-            import dspy
-            with dspy.track_usage() as tracker:
-                if self._mlflow:
-                    with self._mlflow.start_span(
-                        name="agent_turn",
-                        attributes={
-                            "channel": msg.channel,
-                            "chat_id": msg.chat_id,
-                            "sender": msg.sender_id,
-                            "message_preview": msg.content[:120],
-                        },
-                    ):
-                        final_content, tools_used = await self._run_agent_loop(initial_messages)
-                else:
-                    final_content, tools_used = await self._run_agent_loop(initial_messages)
-            usage_totals = tracker.get_total_tokens()
-        except ImportError:
-            final_content, tools_used = await self._run_agent_loop(initial_messages)
+        # Run the agent loop with optional MLflow tracing and token tracking
+        final_content, tools_used, usage_totals = await self._traced_agent_loop(
+            initial_messages, msg,
+        )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

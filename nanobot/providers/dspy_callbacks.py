@@ -1,22 +1,22 @@
-"""DSPy callback for per-tier observability (Phase 2)."""
+"""DSPy callback for per-tier observability."""
 
 import time
 from typing import Any
 
 from loguru import logger
 
+from dspy.utils.callback import BaseCallback
 
-class NanobotCallback:
+
+class NanobotCallback(BaseCallback):
     """Log tier, model, latency, and token counts for every dspy.LM call.
 
-    Register globally via ``dspy.configure(callbacks=[NanobotCallback(tier_map)])``
-    where *tier_map* maps ``dspy.LM`` ids to tier names.
+    Inherits from ``dspy.utils.callback.BaseCallback`` so all hook
+    signatures match and no "missing method" warnings are emitted.
     """
 
     def __init__(self, tier_map: dict[int, str] | None = None):
-        # Maps id(dspy.LM) -> tier name ("quick" / "normal" / "deep")
         self._tier_map: dict[int, str] = tier_map or {}
-        # call_id -> monotonic start time
         self._starts: dict[str, float] = {}
 
     def register_tier(self, lm: Any, tier: str) -> None:
@@ -26,9 +26,7 @@ class NanobotCallback:
     def _tier_for(self, instance: Any) -> str:
         return self._tier_map.get(id(instance), "unknown")
 
-    # ------------------------------------------------------------------
-    # LM hooks
-    # ------------------------------------------------------------------
+    # -- LM hooks ----------------------------------------------------------
 
     def on_lm_start(self, call_id: str, instance: Any, inputs: dict[str, Any]) -> None:
         self._starts[call_id] = time.monotonic()
@@ -42,9 +40,7 @@ class NanobotCallback:
         )
 
     def on_lm_end(
-        self,
-        call_id: str,
-        outputs: dict[str, Any] | None,
+        self, call_id: str, outputs: dict[str, Any] | None,
         exception: Exception | None = None,
     ) -> None:
         elapsed = time.monotonic() - self._starts.pop(call_id, time.monotonic())
@@ -52,10 +48,8 @@ class NanobotCallback:
             logger.warning(f"LM call failed  | {elapsed:.1f}s | {exception}")
             return
 
-        # Extract token counts from the response
         usage: dict[str, int] = {}
         if outputs:
-            # outputs may be a list of strings (simple) or contain response obj
             response = outputs.get("response") if isinstance(outputs, dict) else None
             if response and hasattr(response, "usage") and response.usage:
                 u = response.usage
@@ -73,19 +67,14 @@ class NanobotCallback:
             )
         logger.info(f"LM call done   | {elapsed:.1f}s{tok_str}")
 
-    # ------------------------------------------------------------------
-    # Module hooks (active once Phase 4 adds dspy.Module usage)
-    # ------------------------------------------------------------------
+    # -- Module hooks ------------------------------------------------------
 
     def on_module_start(self, call_id: str, instance: Any, inputs: dict[str, Any]) -> None:
         self._starts[call_id] = time.monotonic()
-        name = type(instance).__name__
-        logger.debug(f"Module start   | {name}")
+        logger.debug(f"Module start   | {type(instance).__name__}")
 
     def on_module_end(
-        self,
-        call_id: str,
-        outputs: Any | None,
+        self, call_id: str, outputs: Any | None,
         exception: Exception | None = None,
     ) -> None:
         elapsed = time.monotonic() - self._starts.pop(call_id, time.monotonic())
@@ -94,23 +83,19 @@ class NanobotCallback:
         else:
             logger.debug(f"Module done    | {elapsed:.1f}s")
 
-    # ------------------------------------------------------------------
-    # Tool hooks (active once Phase 4 wraps tools as dspy.Tool)
-    # ------------------------------------------------------------------
+    # -- Tool hooks --------------------------------------------------------
 
     def on_tool_start(self, call_id: str, instance: Any, inputs: dict[str, Any]) -> None:
         self._starts[call_id] = time.monotonic()
         name = getattr(instance, "name", type(instance).__name__)
-        logger.debug(f"DSPy tool start | {name}")
+        logger.debug(f"Tool start     | {name}")
 
     def on_tool_end(
-        self,
-        call_id: str,
-        outputs: dict[str, Any] | None,
+        self, call_id: str, outputs: dict[str, Any] | None,
         exception: Exception | None = None,
     ) -> None:
         elapsed = time.monotonic() - self._starts.pop(call_id, time.monotonic())
         if exception:
-            logger.warning(f"DSPy tool failed | {elapsed:.1f}s | {exception}")
+            logger.warning(f"Tool failed    | {elapsed:.1f}s | {exception}")
         else:
-            logger.debug(f"DSPy tool done  | {elapsed:.1f}s")
+            logger.debug(f"Tool done      | {elapsed:.1f}s")

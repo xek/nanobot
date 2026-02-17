@@ -173,27 +173,24 @@ class TestBuildHistory:
 # ---------------------------------------------------------------------------
 
 
-class TestNanobotReAct:
-    """Test the NanobotReAct dspy.Module."""
+class TestReActDirect:
+    """Test direct dspy.ReAct creation (no wrapper)."""
 
-    def test_module_creation(self):
+    def test_react_with_tools(self):
         import dspy
-        from nanobot.agent.dspy_agent import NanobotReAct, wrap_nanobot_tool
+        from nanobot.agent.dspy_agent import AgentTurn, wrap_nanobot_tool
 
         tool = wrap_nanobot_tool(DummyTool())
-        agent = NanobotReAct(tools=[tool], max_iters=5)
+        agent = dspy.ReAct(AgentTurn, tools=[tool], max_iters=5)
         assert agent.react is not None
 
-    def test_module_with_instructions(self):
+    def test_react_with_instructions(self):
         import dspy
-        from nanobot.agent.dspy_agent import NanobotReAct, wrap_nanobot_tool
+        from nanobot.agent.dspy_agent import AgentTurn, wrap_nanobot_tool
 
         tool = wrap_nanobot_tool(DummyTool())
-        agent = NanobotReAct(
-            tools=[tool],
-            max_iters=5,
-            instructions="You are Jirard, a sharp AI assistant.",
-        )
+        sig = AgentTurn.with_instructions(f"{AgentTurn.__doc__}\n\nCustom instructions.")
+        agent = dspy.ReAct(sig, tools=[tool], max_iters=5)
         assert agent.react is not None
 
 
@@ -245,10 +242,10 @@ class TestAgentLoopReactIntegration:
     @patch("dspy.configure")
     @patch("dspy.LM")
     def test_init_react_agent_wraps_tools(self, mock_lm_cls, mock_configure):
-        """_init_react_agent creates a NanobotReAct with all registered tools."""
+        """_init_react_agent creates a dspy.ReAct with all registered tools."""
+        import dspy
         from nanobot.config.schema import AgentDefaults, TierConfig, TiersConfig
         from nanobot.agent.loop import AgentLoop
-        from nanobot.agent.dspy_agent import NanobotReAct
         from pathlib import Path
         import tempfile
 
@@ -278,4 +275,4 @@ class TestAgentLoopReactIntegration:
                     agent_defaults=defaults,
                 )
             react_agent = agent._init_react_agent()
-            assert isinstance(react_agent, NanobotReAct)
+            assert isinstance(react_agent, dspy.ReAct)
