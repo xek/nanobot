@@ -359,6 +359,7 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        agent_defaults=config.agents.defaults,
     )
     
     # Set cron callback (needs agent)
@@ -369,6 +370,7 @@ def gateway(
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
+            tier=job.payload.tier or "quick",
         )
         if job.payload.deliver and job.payload.to:
             from nanobot.bus.events import OutboundMessage
@@ -383,7 +385,7 @@ def gateway(
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
         """Execute heartbeat through the agent."""
-        return await agent.process_direct(prompt, session_key="heartbeat")
+        return await agent.process_direct(prompt, session_key="heartbeat", tier="quick")
     
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -469,6 +471,7 @@ def agent(
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        agent_defaults=config.agents.defaults,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on

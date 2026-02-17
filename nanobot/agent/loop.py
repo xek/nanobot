@@ -53,8 +53,9 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        agent_defaults: "AgentDefaults | None" = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, AgentDefaults
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
@@ -68,17 +69,21 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.agent_defaults = agent_defaults or AgentDefaults()
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+
+        # Subagents default to the quick tier
+        sub_model, sub_temp, sub_max_tokens = self.agent_defaults.resolve_tier("quick")
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
             bus=bus,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            model=sub_model if sub_model != self.agent_defaults.model else self.model,
+            temperature=sub_temp,
+            max_tokens=sub_max_tokens,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
@@ -451,6 +456,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        tier: str | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -460,17 +466,29 @@ Respond with ONLY valid JSON, no markdown fences."""
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
+            tier: LLM tier override ("quick", "normal", "deep"). None uses default.
         
         Returns:
             The agent's response.
         """
-        await self._connect_mcp()
-        msg = InboundMessage(
-            channel=channel,
-            sender_id="user",
-            chat_id=chat_id,
-            content=content
-        )
-        
-        response = await self._process_message(msg, session_key=session_key)
-        return response.content if response else ""
+        # Temporarily override model/temperature/max_tokens for this call
+        orig_model, orig_temp, orig_max = self.model, self.temperature, self.max_tokens
+        if tier:
+            t_model, t_temp, t_max = self.agent_defaults.resolve_tier(tier)
+            self.model = t_model
+            self.temperature = t_temp
+            self.max_tokens = t_max
+            logger.info(f"process_direct: tier={tier} -> model={t_model} for session={session_key}")
+
+        try:
+            await self._connect_mcp()
+            msg = InboundMessage(
+                channel=channel,
+                sender_id="user",
+                chat_id=chat_id,
+                content=content
+            )
+            response = await self._process_message(msg, session_key=session_key)
+            return response.content if response else ""
+        finally:
+            self.model, self.temperature, self.max_tokens = orig_model, orig_temp, orig_max
