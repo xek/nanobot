@@ -93,6 +93,10 @@ class AgentLoop:
         # Falls back gracefully if dspy is not installed.
         self.lm_quick, self.lm_normal, self.lm_deep = self._init_dspy_tiers()
 
+        # DSPy observability callback (Phase 2): logs tier, model, latency,
+        # token counts for every dspy.LM call.
+        self._dspy_callback = self._init_dspy_callback()
+
         # Enable MLflow tracing if MLFLOW_TRACKING_URI is set
         self._init_mlflow_tracing()
 
@@ -201,6 +205,45 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to initialise dspy.LM tiers: {e}")
             return None, None, None
+
+    def _init_dspy_callback(self) -> Any:
+        """Create and register the NanobotCallback for per-tier logging.
+
+        Maps each dspy.LM tier instance to its name so the callback can
+        log which tier is being used.  Also registers the provider's
+        underlying LM (the ``normal`` default) if it exposes one.
+        """
+        try:
+            import dspy
+            from nanobot.providers.dspy_callbacks import NanobotCallback
+        except ImportError:
+            return None
+
+        cb = NanobotCallback()
+
+        # Map tier LMs
+        if self.lm_quick:
+            cb.register_tier(self.lm_quick, "quick")
+        if self.lm_normal:
+            cb.register_tier(self.lm_normal, "normal")
+        if self.lm_deep:
+            cb.register_tier(self.lm_deep, "deep")
+
+        # Map the provider's own LM (used by _run_agent_loop)
+        provider_lm = getattr(self.provider, "lm", None)
+        if provider_lm:
+            cb.register_tier(provider_lm, "normal")
+        # Also register cached LMs from DSPyProvider
+        lm_cache = getattr(self.provider, "_lm_cache", {})
+        for lm in lm_cache.values():
+            if id(lm) not in cb._tier_map:
+                cb.register_tier(lm, "normal")
+
+        # Register globally so all dspy.LM calls are observed
+        existing = dspy.settings.get("callbacks", []) or []
+        dspy.configure(callbacks=existing + [cb])
+        logger.debug("DSPy NanobotCallback registered")
+        return cb
 
     def _init_mlflow_tracing(self) -> None:
         """Enable MLflow tracing if MLFLOW_TRACKING_URI is set.
@@ -401,13 +444,29 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+
+        # Track token usage per model for this turn
+        usage_totals: dict[str, dict] = {}
+        try:
+            import dspy
+            with dspy.track_usage() as tracker:
+                final_content, tools_used = await self._run_agent_loop(initial_messages)
+            usage_totals = tracker.get_total_tokens()
+        except ImportError:
+            final_content, tools_used = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
+        if usage_totals:
+            parts = []
+            for model, u in usage_totals.items():
+                short = model.rsplit("/", 1)[-1]
+                parts.append(f"{short}=[in={u.get('prompt_tokens', 0)} out={u.get('completion_tokens', 0)}]")
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview} | usage: {' '.join(parts)}")
+        else:
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
         
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content,

@@ -219,7 +219,8 @@ class TestAgentLoopDspyTiers:
         assert agent.lm_normal is not None
         assert agent.lm_deep is not None
         assert mock_lm_cls.call_count == 3
-        mock_configure.assert_called_once()
+        # dspy.configure called by _init_dspy_tiers and _init_dspy_callback
+        assert mock_configure.call_count >= 1
 
     @patch("dspy.configure")
     @patch("dspy.LM")
@@ -313,3 +314,128 @@ def _make_tool_call(call_id: str, name: str, arguments: str):
     tc.function.name = name
     tc.function.arguments = arguments
     return tc
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: NanobotCallback tests
+# ---------------------------------------------------------------------------
+
+
+class TestNanobotCallback:
+    """Test NanobotCallback logging and tier mapping."""
+
+    def test_register_and_identify_tier(self):
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+
+        cb = NanobotCallback()
+        mock_lm = MagicMock()
+        cb.register_tier(mock_lm, "quick")
+        assert cb._tier_for(mock_lm) == "quick"
+
+    def test_unknown_tier(self):
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+
+        cb = NanobotCallback()
+        assert cb._tier_for(MagicMock()) == "unknown"
+
+    def test_on_lm_start_logs(self, caplog):
+        import logging
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+
+        cb = NanobotCallback()
+        mock_lm = MagicMock()
+        mock_lm.model = "openai/test-model"
+        cb.register_tier(mock_lm, "deep")
+
+        cb.on_lm_start("call-1", mock_lm, {"messages": [{"role": "user", "content": "hi"}]})
+        assert "call-1" in cb._starts
+
+    def test_on_lm_end_pops_start(self):
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+        import time
+
+        cb = NanobotCallback()
+        cb._starts["call-1"] = time.monotonic()
+        cb.on_lm_end("call-1", {"response": None})
+        assert "call-1" not in cb._starts
+
+    def test_on_lm_end_exception(self):
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+        import time
+
+        cb = NanobotCallback()
+        cb._starts["call-1"] = time.monotonic()
+        cb.on_lm_end("call-1", None, exception=RuntimeError("boom"))
+        assert "call-1" not in cb._starts
+
+    def test_on_module_start_end(self):
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+        import time
+
+        cb = NanobotCallback()
+        cb.on_module_start("m-1", MagicMock(), {})
+        assert "m-1" in cb._starts
+        cb.on_module_end("m-1", {"result": "ok"})
+        assert "m-1" not in cb._starts
+
+    def test_on_tool_start_end(self):
+        from nanobot.providers.dspy_callbacks import NanobotCallback
+        import time
+
+        cb = NanobotCallback()
+        tool = MagicMock()
+        tool.name = "read_file"
+        cb.on_tool_start("t-1", tool, {})
+        assert "t-1" in cb._starts
+        cb.on_tool_end("t-1", None, exception=ValueError("bad path"))
+        assert "t-1" not in cb._starts
+
+
+class TestCallbackRegistration:
+    """Test that AgentLoop registers the NanobotCallback."""
+
+    @patch("dspy.settings")
+    @patch("dspy.configure")
+    @patch("dspy.LM")
+    def test_callback_registered_with_tiers(self, mock_lm_cls, mock_configure, mock_settings):
+        from nanobot.config.schema import AgentDefaults, TierConfig, TiersConfig
+        from nanobot.agent.loop import AgentLoop
+
+        mock_settings.get.return_value = []
+        # Return distinct objects so id() differs per tier
+        mock_lm_cls.side_effect = [MagicMock(), MagicMock(), MagicMock()]
+
+        tiers_cfg = {
+            "quick": TierConfig(model="fast/m"),
+            "normal": TierConfig(model="mid/m"),
+            "deep": TierConfig(model="big/m"),
+        }
+        defaults = AgentDefaults(
+            model="mid/m", tiers=TiersConfig(**tiers_cfg),
+        )
+        mock_provider = MagicMock()
+        mock_provider.api_key = "sk-test"
+        mock_provider.api_base = "http://localhost:4000"
+        mock_provider.get_default_model.return_value = "mid/m"
+        mock_provider._resolve_model = lambda m: m
+
+        mock_bus = MagicMock()
+        mock_bus.publish_outbound = AsyncMock()
+
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            with patch("nanobot.agent.loop.SubagentManager"):
+                agent = AgentLoop(
+                    bus=mock_bus,
+                    provider=mock_provider,
+                    workspace=workspace,
+                    agent_defaults=defaults,
+                )
+
+            assert agent._dspy_callback is not None
+            from nanobot.providers.dspy_callbacks import NanobotCallback
+            assert isinstance(agent._dspy_callback, NanobotCallback)
+            # All three tier LMs should be registered
+            assert len(agent._dspy_callback._tier_map) >= 3
