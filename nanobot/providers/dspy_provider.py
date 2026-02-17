@@ -58,15 +58,17 @@ class DSPyProvider(LLMProvider):
         self._lm_cache: dict[str, Any] = {default_model: self._lm}
 
     def _resolve_model(self, model: str) -> str:
-        """Resolve model name by applying gateway/provider prefixes.
+        """Resolve model name for dspy.LM (which uses litellm internally).
 
-        Mirrors LiteLLMProvider._resolve_model so that models routed through
-        a LiteLLM proxy get the correct ``openai/`` prefix.
+        For gateway/proxy setups the model name must keep its original
+        provider prefix (e.g. ``gemini/``) so the proxy can route it,
+        but also needs ``openai/`` so litellm uses the OpenAI protocol.
+
+        Unlike LiteLLMProvider._resolve_model we never strip the model
+        prefix — the proxy needs it to select the correct upstream.
         """
         if self._gateway:
             prefix = self._gateway.litellm_prefix
-            if self._gateway.strip_model_prefix:
-                model = model.split("/")[-1]
             if prefix and not model.startswith(f"{prefix}/"):
                 model = f"{prefix}/{model}"
             return model
