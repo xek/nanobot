@@ -89,6 +89,10 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
         
+        # DSPy LM tiers (quick/normal/deep) for use with dspy modules.
+        # Falls back gracefully if dspy is not installed.
+        self.lm_quick, self.lm_normal, self.lm_deep = self._init_dspy_tiers()
+
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -127,6 +131,65 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
     
+    def _init_dspy_tiers(self) -> tuple[Any, Any, Any]:
+        """Create dspy.LM instances for the quick / normal / deep tiers.
+
+        Returns (lm_quick, lm_normal, lm_deep). If dspy is not installed
+        or tier models are not configured, returns (None, None, None).
+        The normal tier is set as the global default via dspy.configure().
+        """
+        try:
+            import dspy
+        except ImportError:
+            logger.debug("dspy not installed, skipping LM tier init")
+            return None, None, None
+
+        # Collect connection kwargs from the underlying provider
+        lm_kwargs: dict[str, Any] = {}
+        if getattr(self.provider, "api_key", None):
+            lm_kwargs["api_key"] = self.provider.api_key
+        if getattr(self.provider, "api_base", None):
+            lm_kwargs["api_base"] = self.provider.api_base
+
+        q_model, q_temp, q_max = self.agent_defaults.resolve_tier("quick")
+        n_model, n_temp, n_max = self.agent_defaults.resolve_tier("normal")
+        d_model, d_temp, d_max = self.agent_defaults.resolve_tier("deep")
+
+        # Only create LMs when at least one tier has a distinct model
+        has_tiers = any(
+            t.model for t in [
+                self.agent_defaults.tiers.quick,
+                self.agent_defaults.tiers.normal,
+                self.agent_defaults.tiers.deep,
+            ]
+        )
+        if not has_tiers:
+            logger.debug("No tier models configured, skipping dspy.LM init")
+            return None, None, None
+
+        try:
+            lm_quick = dspy.LM(
+                q_model, temperature=q_temp, max_tokens=q_max,
+                cache=False, **lm_kwargs,
+            )
+            lm_normal = dspy.LM(
+                n_model, temperature=n_temp, max_tokens=n_max,
+                cache=False, **lm_kwargs,
+            )
+            lm_deep = dspy.LM(
+                d_model, temperature=d_temp, max_tokens=d_max,
+                cache=False, **lm_kwargs,
+            )
+            dspy.configure(lm=lm_normal)
+            logger.info(
+                f"DSPy LM tiers initialised: "
+                f"quick={q_model}, normal={n_model}, deep={d_model}"
+            )
+            return lm_quick, lm_normal, lm_deep
+        except Exception as e:
+            logger.warning(f"Failed to initialise dspy.LM tiers: {e}")
+            return None, None, None
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or not self._mcp_servers:

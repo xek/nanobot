@@ -42,6 +42,7 @@ def test_cron_tool_add_job_with_tier(tmp_path):
         message="check weather",
         every_seconds=3600,
         cron_expr=None,
+        tz=None,
         at=None,
         tier="quick",
     )
@@ -62,6 +63,7 @@ def test_cron_tool_add_job_without_tier(tmp_path):
         message="remind me",
         every_seconds=60,
         cron_expr=None,
+        tz=None,
         at=None,
     )
     assert "tier:" not in result
@@ -81,6 +83,7 @@ def test_cron_tool_add_job_invalid_tier(tmp_path):
         message="remind me",
         every_seconds=60,
         cron_expr=None,
+        tz=None,
         at=None,
         tier="invalid",
     )
@@ -98,8 +101,8 @@ def test_cron_tool_list_jobs_shows_tier(tmp_path):
     tool = CronTool(svc)
     tool.set_context("cli", "direct")
 
-    tool._add_job("task A", every_seconds=60, cron_expr=None, at=None, tier="deep")
-    tool._add_job("task B", every_seconds=120, cron_expr=None, at=None)
+    tool._add_job("task A", every_seconds=60, cron_expr=None, tz=None, at=None, tier="deep")
+    tool._add_job("task B", every_seconds=120, cron_expr=None, tz=None, at=None)
 
     listing = tool._list_jobs()
     assert "tier: deep" in listing
