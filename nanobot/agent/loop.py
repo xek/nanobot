@@ -281,12 +281,8 @@ class AgentLoop:
             self._tracer = trace.get_tracer("nanobot")
             self.subagents.set_tracer(self._tracer)
 
-            try:
-                import litellm
-                litellm.callbacks = ["otel"]
-                logger.info("litellm OTel callback enabled")
-            except Exception as cb_err:
-                logger.debug(f"Could not enable litellm OTel callback: {cb_err}")
+            if self._dspy_callback:
+                self._dspy_callback.set_tracer(self._tracer)
 
             logger.info(f"OpenTelemetry tracing enabled → {endpoint}")
         except ImportError:

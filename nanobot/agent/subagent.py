@@ -115,15 +115,11 @@ class SubagentManager:
         use_max = max_tokens if max_tokens is not None else self.max_tokens
 
         for iteration in range(1, max_iterations + 1):
-            with self._span("llm", attributes={"iteration": iteration, "model": use_model}) as span:
-                response = await self.provider.chat(
-                    messages=messages, tools=tools.get_definitions(),
-                    model=use_model, temperature=use_temp, max_tokens=use_max,
-                )
-                if span and span.is_recording():
-                    span.set_attribute("response_preview", (response.content or "")[:500])
-                    if response.has_tool_calls:
-                        span.set_attribute("tool_calls", [tc.name for tc in response.tool_calls])
+            # LM call is traced automatically by NanobotCallback (on_lm_start/end)
+            response = await self.provider.chat(
+                messages=messages, tools=tools.get_definitions(),
+                model=use_model, temperature=use_temp, max_tokens=use_max,
+            )
 
             if not response.has_tool_calls:
                 return response.content or "Task completed but no final response was generated."
