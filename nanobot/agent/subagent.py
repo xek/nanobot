@@ -50,6 +50,11 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._shared_tools: list[Any] = []
+        self._mlflow: Any = None
+
+    def set_mlflow(self, mlflow_module: Any) -> None:
+        """Set the mlflow module for tracing subagent calls."""
+        self._mlflow = mlflow_module
 
     def set_shared_tools(self, parent_registry: "ToolRegistry") -> None:
         """Copy MCP and other shared tools from the parent agent's registry.
@@ -109,12 +114,8 @@ class SubagentManager:
         use_max = max_tokens if max_tokens is not None else self.max_tokens
 
         for iteration in range(1, max_iterations + 1):
-            response = await self.provider.chat(
-                messages=messages,
-                tools=tools.get_definitions(),
-                model=use_model,
-                temperature=use_temp,
-                max_tokens=use_max,
+            response = await self._traced_chat(
+                tag, iteration, messages, tools, use_model, use_temp, use_max,
             )
 
             if not response.has_tool_calls:
@@ -138,8 +139,9 @@ class SubagentManager:
             })
 
             for tool_call in response.tool_calls:
-                logger.debug(f"[{tag}] executing: {tool_call.name}")
-                result = await tools.execute(tool_call.name, tool_call.arguments)
+                result = await self._traced_tool(
+                    tag, tools, tool_call.name, tool_call.arguments, tool_call.id,
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -148,6 +150,40 @@ class SubagentManager:
                 })
 
         return "Task completed but no final response was generated."
+
+    async def _traced_chat(
+        self, tag: str, iteration: int,
+        messages: list, tools: ToolRegistry,
+        model: str, temperature: float, max_tokens: int,
+    ) -> LLMResponse:
+        """LLM call with optional MLflow span."""
+        if self._mlflow:
+            with self._mlflow.start_span(
+                name=f"subagent.chat",
+                attributes={"tag": tag, "iteration": iteration, "model": model},
+            ):
+                return await self.provider.chat(
+                    messages=messages, tools=tools.get_definitions(),
+                    model=model, temperature=temperature, max_tokens=max_tokens,
+                )
+        return await self.provider.chat(
+            messages=messages, tools=tools.get_definitions(),
+            model=model, temperature=temperature, max_tokens=max_tokens,
+        )
+
+    async def _traced_tool(
+        self, tag: str, tools: ToolRegistry,
+        tool_name: str, tool_args: dict, tool_call_id: str,
+    ) -> str:
+        """Tool execution with optional MLflow span."""
+        logger.debug(f"[{tag}] executing: {tool_name}")
+        if self._mlflow:
+            with self._mlflow.start_span(
+                name=f"subagent.tool.{tool_name}",
+                attributes={"tag": tag, "tool": tool_name, "args": json.dumps(tool_args)[:500]},
+            ):
+                return await tools.execute(tool_name, tool_args)
+        return await tools.execute(tool_name, tool_args)
 
     # -- public entry points -------------------------------------------------
 
@@ -165,6 +201,16 @@ class SubagentManager:
         tag = f"inline-{str(uuid.uuid4())[:6]}"
         logger.info(f"[{tag}] starting inline task: {task[:60]}...")
         try:
+            if self._mlflow:
+                with self._mlflow.start_span(
+                    name="think.inline",
+                    attributes={"tag": tag, "model": model or self.model,
+                                "task_preview": task[:200]},
+                ):
+                    return await self._run_task_loop(
+                        task, tag, model=model, temperature=temperature,
+                        max_tokens=max_tokens, max_iterations=10,
+                    )
             return await self._run_task_loop(
                 task, tag, model=model, temperature=temperature,
                 max_tokens=max_tokens, max_iterations=10,
@@ -201,8 +247,17 @@ class SubagentManager:
     ) -> None:
         """Background wrapper: runs the loop and announces the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
+        tag = f"bg-{task_id}"
         try:
-            result = await self._run_task_loop(task, tag=f"bg-{task_id}")
+            if self._mlflow:
+                with self._mlflow.start_span(
+                    name="think.background",
+                    attributes={"tag": tag, "label": label,
+                                "task_preview": task[:200]},
+                ):
+                    result = await self._run_task_loop(task, tag=tag)
+            else:
+                result = await self._run_task_loop(task, tag=tag)
             logger.info(f"Subagent [{task_id}] completed successfully")
             await self._announce_result(task_id, label, task, result, origin, "ok")
         except Exception as e:

@@ -280,6 +280,7 @@ class AgentLoop:
             mlflow.set_experiment("nanobot")
             mlflow.dspy.autolog()
             self._mlflow = mlflow
+            self.subagents.set_mlflow(mlflow)
 
             logger.info(f"MLflow tracing enabled → {tracking_uri}")
         except ImportError:
