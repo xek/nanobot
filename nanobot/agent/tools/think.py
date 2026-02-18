@@ -46,11 +46,15 @@ class ThinkTool(Tool):
     def description(self) -> str:
         return (
             "Delegate a subtask to a different thinking mode. "
-            "'quick' = fast/cheap inline call for simple subtasks (classification, reformatting, yes/no). "
-            "'deep' = powerful inline call for hard problems or self-reflection. "
-            "'background' = spawn a full subagent with tools that runs asynchronously and reports back. "
+            "'quick' = fast/cheap inline call for trivial mechanical subtasks ONLY "
+            "(e.g. 'is X a valid email?', 'extract the date from this string'). "
+            "Do NOT use quick for summarisation or analysis — you can do that yourself. "
+            "'deep' = powerful inline call for hard problems, self-reflection, or when you are stuck. "
+            "'background' = spawn a full subagent with tools that runs asynchronously "
+            "and reports back — use for complex tasks that can run independently. "
             "IMPORTANT: For quick/deep modes, the LLM only sees 'prompt' and 'context'. "
-            "You MUST paste any relevant data (tool outputs, file contents, etc.) into the 'context' field."
+            "You MUST paste any relevant data into 'context'. "
+            "If you already have the answer in your trajectory, do NOT call this tool."
         )
 
     @property
