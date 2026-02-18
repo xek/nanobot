@@ -159,6 +159,15 @@ class SubagentManager:
 
     # -- OTel tracing helpers --------------------------------------------------
 
+    @staticmethod
+    def _clear_otel_context() -> None:
+        """Detach inherited OTel context so the next span starts a fresh trace."""
+        try:
+            from opentelemetry import context
+            context.attach(context.Context())
+        except ImportError:
+            pass
+
     @contextmanager
     def _span(self, name: str, attributes: dict | None = None):
         """Start an OTel span as a child of the current context, or no-op."""
@@ -225,9 +234,10 @@ class SubagentManager:
     ) -> None:
         """Background wrapper: runs the loop and announces the result.
 
-        OTel context is inherited from ``spawn()`` via asyncio.create_task,
-        so the background span nests under the parent agent_turn trace.
+        Clears the inherited OTel context so the background task gets
+        its own independent trace rather than dangling off the parent.
         """
+        self._clear_otel_context()
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         tag = f"bg-{task_id}"
         try:
