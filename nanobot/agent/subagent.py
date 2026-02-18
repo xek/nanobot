@@ -50,11 +50,22 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._shared_tools: list[Any] = []
-        self._mlflow: Any = None
+        self._mlflow_client: Any = None
+        self._mlflow_experiment_id: str | None = None
 
     def set_mlflow(self, mlflow_module: Any) -> None:
-        """Set the mlflow module for tracing subagent calls."""
-        self._mlflow = mlflow_module
+        """Set the mlflow module for tracing subagent calls via MlflowClient.
+
+        Uses the imperative client API (start_trace/start_span/end_span/end_trace)
+        which doesn't depend on async context propagation.
+        """
+        try:
+            self._mlflow_client = mlflow_module.MlflowClient()
+            exp = mlflow_module.get_experiment_by_name("nanobot")
+            self._mlflow_experiment_id = exp.experiment_id if exp else None
+        except Exception as e:
+            logger.warning(f"Failed to init MLflow client for subagent: {e}")
+            self._mlflow_client = None
 
     def set_shared_tools(self, parent_registry: "ToolRegistry") -> None:
         """Copy MCP and other shared tools from the parent agent's registry.
@@ -97,12 +108,13 @@ class SubagentManager:
         temperature: float | None = None,
         max_tokens: int | None = None,
         max_iterations: int = 15,
-        parent_span: Any = None,
+        trace_id: str | None = None,
+        root_span_id: str | None = None,
     ) -> str:
         """Core agent loop: chat with tools until the LLM produces a final answer.
 
         Used by both ``spawn`` (background) and ``run_inline`` (synchronous).
-        ``parent_span`` is an optional MLflow LiveSpan for nesting child spans.
+        ``trace_id`` / ``root_span_id`` are for nesting MLflow spans.
         """
         tools = self._build_tools()
         system_prompt = self._build_subagent_prompt(task)
@@ -116,8 +128,8 @@ class SubagentManager:
         use_max = max_tokens if max_tokens is not None else self.max_tokens
 
         for iteration in range(1, max_iterations + 1):
-            chat_span = self._start_child_span(
-                f"subagent.chat", parent_span,
+            chat_span = self._span_start(
+                "subagent.chat", trace_id, root_span_id,
                 attributes={"tag": tag, "iteration": iteration, "model": use_model},
             )
             try:
@@ -126,8 +138,7 @@ class SubagentManager:
                     model=use_model, temperature=use_temp, max_tokens=use_max,
                 )
             finally:
-                if chat_span:
-                    chat_span.end()
+                self._span_end(trace_id, chat_span)
 
             if not response.has_tool_calls:
                 return response.content or "Task completed but no final response was generated."
@@ -151,17 +162,13 @@ class SubagentManager:
 
             for tool_call in response.tool_calls:
                 logger.debug(f"[{tag}] executing: {tool_call.name}")
-                tool_span = self._start_child_span(
-                    f"subagent.tool.{tool_call.name}", parent_span,
+                tool_span = self._span_start(
+                    f"subagent.tool.{tool_call.name}", trace_id, root_span_id,
                     attributes={"tag": tag, "tool": tool_call.name,
                                 "args": json.dumps(tool_call.arguments)[:500]},
                 )
-                try:
-                    result = await tools.execute(tool_call.name, tool_call.arguments)
-                finally:
-                    if tool_span:
-                        tool_span.set_outputs({"result_preview": result[:300]})
-                        tool_span.end()
+                result = await tools.execute(tool_call.name, tool_call.arguments)
+                self._span_end(trace_id, tool_span, outputs={"preview": result[:300]})
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -171,21 +178,57 @@ class SubagentManager:
 
         return "Task completed but no final response was generated."
 
-    def _start_child_span(
-        self, name: str, parent_span: Any = None, **kwargs: Any
-    ) -> Any:
-        """Create a child span under ``parent_span`` using the no-context API.
+    # -- MLflow client-based tracing (no context dependency) -------------------
 
-        Returns the LiveSpan, or None if MLflow is not available.
-        """
-        if not self._mlflow:
+    def _trace_start(self, name: str, **attrs: Any) -> tuple[str | None, str | None]:
+        """Start a new MLflow trace and root span.  Returns (trace_id, span_id)."""
+        if not self._mlflow_client:
+            return None, None
+        try:
+            root = self._mlflow_client.start_trace(
+                name=name,
+                experiment_id=self._mlflow_experiment_id,
+                attributes=attrs,
+            )
+            return root.trace_id, root.span_id
+        except Exception as e:
+            logger.debug(f"MLflow start_trace failed: {e}")
+            return None, None
+
+    def _trace_end(self, trace_id: str | None, **outputs: Any) -> None:
+        """End an MLflow trace."""
+        if not trace_id or not self._mlflow_client:
+            return
+        try:
+            self._mlflow_client.end_trace(trace_id, outputs=outputs or None)
+        except Exception as e:
+            logger.debug(f"MLflow end_trace failed: {e}")
+
+    def _span_start(
+        self, name: str, trace_id: str | None, parent_id: str | None, **kwargs: Any
+    ) -> str | None:
+        """Create a child span.  Returns span_id or None."""
+        if not trace_id or not parent_id or not self._mlflow_client:
             return None
         try:
-            return self._mlflow.start_span_no_context(
-                name=name, parent_span=parent_span, **kwargs,
+            span = self._mlflow_client.start_span(
+                name=name, trace_id=trace_id, parent_id=parent_id, **kwargs,
             )
-        except Exception:
+            return span.span_id
+        except Exception as e:
+            logger.debug(f"MLflow start_span failed: {e}")
             return None
+
+    def _span_end(
+        self, trace_id: str | None, span_id: str | None, outputs: dict | None = None,
+    ) -> None:
+        """End a child span."""
+        if not trace_id or not span_id or not self._mlflow_client:
+            return
+        try:
+            self._mlflow_client.end_span(trace_id, span_id, outputs=outputs)
+        except Exception as e:
+            logger.debug(f"MLflow end_span failed: {e}")
 
     # -- public entry points -------------------------------------------------
 
@@ -202,23 +245,22 @@ class SubagentManager:
         """
         tag = f"inline-{str(uuid.uuid4())[:6]}"
         logger.info(f"[{tag}] starting inline task: {task[:60]}...")
-        root = self._start_child_span(
-            "think.inline", parent_span=None,
-            attributes={"tag": tag, "model": model or self.model,
-                        "task_preview": task[:200]},
+        trace_id, root_span_id = self._trace_start(
+            "think.inline", tag=tag, model=model or self.model,
+            task_preview=task[:200],
         )
         try:
-            return await self._run_task_loop(
+            result = await self._run_task_loop(
                 task, tag, model=model, temperature=temperature,
                 max_tokens=max_tokens, max_iterations=10,
-                parent_span=root,
+                trace_id=trace_id, root_span_id=root_span_id,
             )
+            self._trace_end(trace_id, result_preview=result[:500])
+            return result
         except Exception as e:
             logger.error(f"[{tag}] failed: {e}")
+            self._trace_end(trace_id, error=str(e))
             return f"Error: {e}"
-        finally:
-            if root:
-                root.end()
 
     async def spawn(
         self,
@@ -249,23 +291,21 @@ class SubagentManager:
         """Background wrapper: runs the loop and announces the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         tag = f"bg-{task_id}"
-        root = self._start_child_span(
-            "think.background", parent_span=None,
-            attributes={"tag": tag, "label": label, "task_preview": task[:200]},
+        trace_id, root_span_id = self._trace_start(
+            "think.background", tag=tag, label=label, task_preview=task[:200],
         )
         try:
-            result = await self._run_task_loop(task, tag=tag, parent_span=root)
+            result = await self._run_task_loop(
+                task, tag=tag, trace_id=trace_id, root_span_id=root_span_id,
+            )
             logger.info(f"Subagent [{task_id}] completed successfully")
-            if root:
-                root.set_outputs({"result_preview": result[:500]})
+            self._trace_end(trace_id, result_preview=result[:500])
             await self._announce_result(task_id, label, task, result, origin, "ok")
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error(f"Subagent [{task_id}] failed: {e}")
+            self._trace_end(trace_id, error=str(e))
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
-        finally:
-            if root:
-                root.end()
 
     async def _announce_result(
         self,
