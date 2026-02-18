@@ -305,7 +305,7 @@ def _make_provider(config: Config):
     api_key = p.api_key if p else None
     api_base = config.get_api_base(model)
 
-    # Try DSPyProvider first — enables mlflow.dspy.autolog() tracing
+    # Try DSPyProvider first — enables OTel tracing
     try:
         from nanobot.providers.dspy_provider import DSPyProvider
         return DSPyProvider(

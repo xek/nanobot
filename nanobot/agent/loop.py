@@ -97,8 +97,7 @@ class AgentLoop:
         # token counts for every dspy.LM call.
         self._dspy_callback = self._init_dspy_callback()
 
-        # Enable MLflow tracing if MLFLOW_TRACKING_URI is set
-        self._init_mlflow_tracing()
+        self._init_otel_tracing()
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -259,36 +258,36 @@ class AgentLoop:
         logger.debug("DSPy NanobotCallback registered")
         return cb
 
-    def _init_mlflow_tracing(self) -> None:
-        """Enable MLflow tracing if MLFLOW_TRACKING_URI is set.
-
-        Calls mlflow.dspy.autolog() so every dspy.LM call is automatically
-        traced.  Each conversation turn is wrapped in its own
-        ``mlflow.start_span()`` context so that traces are scoped per
-        turn rather than per process lifetime.
-        """
+    def _init_otel_tracing(self) -> None:
+        """Enable OpenTelemetry tracing if OTEL_EXPORTER_OTLP_ENDPOINT is set."""
         import os
-        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
-        if not tracking_uri:
-            self._mlflow = None
+        endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if not endpoint:
+            self._tracer = None
             return
 
         try:
-            import mlflow
+            from opentelemetry import trace
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
-            mlflow.set_tracking_uri(tracking_uri)
-            mlflow.set_experiment("nanobot")
-            mlflow.dspy.autolog()
-            self._mlflow = mlflow
-            self.subagents.set_mlflow(mlflow)
+            resource = Resource.create({"service.name": "nanobot"})
+            provider = TracerProvider(resource=resource)
+            exporter = OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces")
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            trace.set_tracer_provider(provider)
+            self._tracer = trace.get_tracer("nanobot")
+            self.subagents.set_tracer(self._tracer)
 
-            logger.info(f"MLflow tracing enabled → {tracking_uri}")
+            logger.info(f"OpenTelemetry tracing enabled → {endpoint}")
         except ImportError:
-            self._mlflow = None
-            logger.debug("mlflow not installed, skipping tracing setup")
+            self._tracer = None
+            logger.debug("opentelemetry not installed, skipping tracing setup")
         except Exception as e:
-            self._mlflow = None
-            logger.warning(f"Failed to initialise MLflow tracing: {e}")
+            self._tracer = None
+            logger.warning(f"Failed to initialise OpenTelemetry tracing: {e}")
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -339,7 +338,7 @@ class AgentLoop:
     async def _traced_agent_loop(
         self, initial_messages: list[dict], msg: InboundMessage,
     ) -> tuple[str | None, list[str], dict[str, dict]]:
-        """Run the agent loop with optional DSPy usage tracking and MLflow span."""
+        """Run the agent loop with optional DSPy usage tracking and OTel span."""
         usage_totals: dict[str, dict] = {}
 
         try:
@@ -349,9 +348,9 @@ class AgentLoop:
             return content, tools, usage_totals
 
         with dspy.track_usage() as tracker:
-            if self._mlflow:
-                with self._mlflow.start_span(
-                    name="agent_turn",
+            if self._tracer:
+                with self._tracer.start_as_current_span(
+                    "agent_turn",
                     attributes={
                         "channel": msg.channel,
                         "chat_id": msg.chat_id,

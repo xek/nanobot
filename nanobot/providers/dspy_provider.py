@@ -15,7 +15,7 @@ class DSPyProvider(LLMProvider):
 
     Provides the same interface as LiteLLMProvider but routes calls through
     DSPy's LM abstraction, gaining:
-    - Automatic MLflow tracing via mlflow.dspy.autolog()
+    - Automatic tracing via OpenTelemetry
     - Retry with exponential backoff
     - Call history for observability
     - Foundation for dspy.Predict / dspy.ReAct integration
