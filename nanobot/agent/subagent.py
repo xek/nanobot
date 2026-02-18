@@ -10,7 +10,7 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -64,7 +64,115 @@ class SubagentManager:
             tool for name, tool in parent_registry._tools.items()
             if name not in exclude and isinstance(tool, MCPToolWrapper)
         ]
-    
+
+    def _build_tools(self) -> ToolRegistry:
+        """Build the tool registry for a subagent run."""
+        tools = ToolRegistry()
+        allowed_dir = self.workspace if self.restrict_to_workspace else None
+        tools.register(ReadFileTool(allowed_dir=allowed_dir))
+        tools.register(WriteFileTool(allowed_dir=allowed_dir))
+        tools.register(EditFileTool(allowed_dir=allowed_dir))
+        tools.register(ListDirTool(allowed_dir=allowed_dir))
+        tools.register(ExecTool(
+            working_dir=str(self.workspace),
+            timeout=self.exec_config.timeout,
+            restrict_to_workspace=self.restrict_to_workspace,
+        ))
+        tools.register(WebSearchTool(api_key=self.brave_api_key))
+        tools.register(WebFetchTool())
+        for shared_tool in self._shared_tools:
+            tools.register(shared_tool)
+        return tools
+
+    async def _run_task_loop(
+        self,
+        task: str,
+        tag: str,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        max_iterations: int = 15,
+    ) -> str:
+        """Core agent loop: chat with tools until the LLM produces a final answer.
+
+        Used by both ``spawn`` (background) and ``run_inline`` (synchronous).
+        """
+        tools = self._build_tools()
+        system_prompt = self._build_subagent_prompt(task)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+        ]
+
+        use_model = model or self.model
+        use_temp = temperature if temperature is not None else self.temperature
+        use_max = max_tokens if max_tokens is not None else self.max_tokens
+
+        for iteration in range(1, max_iterations + 1):
+            response = await self.provider.chat(
+                messages=messages,
+                tools=tools.get_definitions(),
+                model=use_model,
+                temperature=use_temp,
+                max_tokens=use_max,
+            )
+
+            if not response.has_tool_calls:
+                return response.content or "Task completed but no final response was generated."
+
+            tool_call_dicts = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments),
+                    },
+                }
+                for tc in response.tool_calls
+            ]
+            messages.append({
+                "role": "assistant",
+                "content": response.content or "",
+                "tool_calls": tool_call_dicts,
+            })
+
+            for tool_call in response.tool_calls:
+                logger.debug(f"[{tag}] executing: {tool_call.name}")
+                result = await tools.execute(tool_call.name, tool_call.arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.name,
+                    "content": result,
+                })
+
+        return "Task completed but no final response was generated."
+
+    # -- public entry points -------------------------------------------------
+
+    async def run_inline(
+        self,
+        task: str,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Run a task synchronously (awaited) and return the result directly.
+
+        Used by the think tool for quick/deep inline modes.
+        """
+        tag = f"inline-{str(uuid.uuid4())[:6]}"
+        logger.info(f"[{tag}] starting inline task: {task[:60]}...")
+        try:
+            return await self._run_task_loop(
+                task, tag, model=model, temperature=temperature,
+                max_tokens=max_tokens, max_iterations=10,
+            )
+        except Exception as e:
+            logger.error(f"[{tag}] failed: {e}")
+            return f"Error: {e}"
+
     async def spawn(
         self,
         task: str,
@@ -72,133 +180,36 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
     ) -> str:
-        """
-        Spawn a subagent to execute a task in the background.
-        
-        Args:
-            task: The task description for the subagent.
-            label: Optional human-readable label for the task.
-            origin_channel: The channel to announce results to.
-            origin_chat_id: The chat ID to announce results to.
-        
-        Returns:
-            Status message indicating the subagent was started.
-        """
+        """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        
-        origin = {
-            "channel": origin_channel,
-            "chat_id": origin_chat_id,
-        }
-        
-        # Create background task
+        origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_background(task_id, task, display_label, origin)
         )
         self._running_tasks[task_id] = bg_task
-        
-        # Cleanup when done
         bg_task.add_done_callback(lambda _: self._running_tasks.pop(task_id, None))
-        
+
         logger.info(f"Spawned subagent [{task_id}]: {display_label}")
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
-    
-    async def _run_subagent(
-        self,
-        task_id: str,
-        task: str,
-        label: str,
-        origin: dict[str, str],
+        return f"Background task [{display_label}] started (id: {task_id}). I'll report back when it's done."
+
+    # -- internal helpers ----------------------------------------------------
+
+    async def _run_background(
+        self, task_id: str, task: str, label: str, origin: dict[str, str],
     ) -> None:
-        """Execute the subagent task and announce the result."""
+        """Background wrapper: runs the loop and announces the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
-        
         try:
-            tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
-            tools.register(ReadFileTool(allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(allowed_dir=allowed_dir))
-            tools.register(EditFileTool(allowed_dir=allowed_dir))
-            tools.register(ListDirTool(allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-            ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
-            tools.register(WebFetchTool())
-            for shared_tool in self._shared_tools:
-                tools.register(shared_tool)
-            
-            # Build messages with subagent-specific prompt
-            system_prompt = self._build_subagent_prompt(task)
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ]
-            
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
-            
-            while iteration < max_iterations:
-                iteration += 1
-                
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
-                
-                if response.has_tool_calls:
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
-                    })
-                    
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments)
-                        logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
-                    break
-            
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
-            
+            result = await self._run_task_loop(task, tag=f"bg-{task_id}")
             logger.info(f"Subagent [{task_id}] completed successfully")
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
-            
+            await self._announce_result(task_id, label, task, result, origin, "ok")
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error(f"Subagent [{task_id}] failed: {e}")
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
-    
+
     async def _announce_result(
         self,
         task_id: str,
@@ -210,7 +221,7 @@ class SubagentManager:
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
-        
+
         announce_content = f"""[Subagent '{label}' {status_text}]
 
 Task: {task}
@@ -219,15 +230,13 @@ Result:
 {result}
 
 Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
-        
-        # Inject as system message to trigger main agent
+
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
         )
-        
         await self.bus.publish_inbound(msg)
         logger.debug(f"Subagent [{task_id}] announced result to {origin['channel']}:{origin['chat_id']}")
     

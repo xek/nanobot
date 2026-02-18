@@ -1,7 +1,6 @@
 """Tests for the unified ThinkTool (inline quick/deep + background)."""
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -11,28 +10,19 @@ from nanobot.agent.tools.think import ThinkTool
 # -- fixtures --
 
 @pytest.fixture
-def lm_quick():
-    return MagicMock(name="lm_quick")
-
-
-@pytest.fixture
-def lm_deep():
-    return MagicMock(name="lm_deep")
-
-
-@pytest.fixture
 def subagent_manager():
     mgr = AsyncMock()
     mgr.spawn = AsyncMock(return_value="Background task started (id: abc123).")
+    mgr.run_inline = AsyncMock(return_value="Inline result from subagent.")
     return mgr
 
 
 @pytest.fixture
-def full_tool(lm_quick, lm_deep, subagent_manager):
+def full_tool(subagent_manager):
     return ThinkTool(
-        lm_quick=lm_quick,
-        lm_deep=lm_deep,
         subagent_manager=subagent_manager,
+        quick_config=("fast/model", 0.2, 2048),
+        deep_config=("powerful/model", 1.0, 16384),
     )
 
 
@@ -47,13 +37,13 @@ def test_description_mentions_all_modes(full_tool):
     assert "quick" in desc
     assert "deep" in desc
     assert "background" in desc
+    assert "tool" in desc.lower()
 
 
 def test_parameters_schema(full_tool):
     params = full_tool.parameters
     props = params["properties"]
     assert "prompt" in props
-    assert "context" in props
     assert "mode" in props
     assert "label" in props
     assert params["required"] == ["prompt", "mode"]
@@ -63,107 +53,52 @@ def test_parameters_schema(full_tool):
 # -- inline modes --
 
 @pytest.mark.asyncio
-async def test_inline_quick(full_tool, lm_quick):
-    mock_result = MagicMock()
-    mock_result.result = "42"
+async def test_inline_quick(full_tool, subagent_manager):
+    result = await full_tool.execute(prompt="Classify this text", mode="quick")
 
-    with patch("dspy.context") as ctx_mock, \
-         patch("dspy.Predict") as predict_cls:
-        ctx_mock.return_value.__enter__ = MagicMock()
-        ctx_mock.return_value.__exit__ = MagicMock(return_value=False)
-        predict_cls.return_value.return_value = mock_result
-
-        result = await full_tool.execute(prompt="What is 6*7?", mode="quick")
-
-    assert result == "42"
-    ctx_mock.assert_called_once_with(lm=lm_quick)
-    # Without context, should use "prompt -> result" signature
-    predict_cls.assert_called_once_with("prompt -> result")
-
-
-@pytest.mark.asyncio
-async def test_inline_deep(full_tool, lm_deep):
-    mock_result = MagicMock()
-    mock_result.result = "deep answer"
-
-    with patch("dspy.context") as ctx_mock, \
-         patch("dspy.Predict") as predict_cls:
-        ctx_mock.return_value.__enter__ = MagicMock()
-        ctx_mock.return_value.__exit__ = MagicMock(return_value=False)
-        predict_cls.return_value.return_value = mock_result
-
-        result = await full_tool.execute(prompt="Hard question", mode="deep")
-
-    assert result == "deep answer"
-    ctx_mock.assert_called_once_with(lm=lm_deep)
-
-
-@pytest.mark.asyncio
-async def test_inline_with_context(full_tool, lm_quick):
-    """When context is provided, the LLM gets a 'context, prompt -> result' signature."""
-    mock_result = MagicMock()
-    mock_result.result = "The page describes a 6-level hierarchy."
-
-    with patch("dspy.context") as ctx_mock, \
-         patch("dspy.Predict") as predict_cls:
-        ctx_mock.return_value.__enter__ = MagicMock()
-        ctx_mock.return_value.__exit__ = MagicMock(return_value=False)
-        predict_cls.return_value.return_value = mock_result
-
-        result = await full_tool.execute(
-            prompt="Summarize the Jira methodology",
-            context="Level 6: Strategic Goal\nLevel 5: Outcome\nLevel 4: Feature",
-            mode="quick",
-        )
-
-    assert result == "The page describes a 6-level hierarchy."
-    predict_cls.assert_called_once_with("context, prompt -> result")
-    predict_cls.return_value.assert_called_once_with(
-        context="Level 6: Strategic Goal\nLevel 5: Outcome\nLevel 4: Feature",
-        prompt="Summarize the Jira methodology",
+    assert result == "Inline result from subagent."
+    subagent_manager.run_inline.assert_awaited_once_with(
+        task="Classify this text",
+        model="fast/model",
+        temperature=0.2,
+        max_tokens=2048,
     )
 
 
 @pytest.mark.asyncio
-async def test_background_with_context(full_tool, subagent_manager):
-    """Context is appended to the task for background mode."""
-    await full_tool.execute(
-        prompt="Analyze this data",
-        context="some data here",
-        mode="background",
-        label="analysis",
+async def test_inline_deep(full_tool, subagent_manager):
+    result = await full_tool.execute(prompt="Hard question", mode="deep")
+
+    assert result == "Inline result from subagent."
+    subagent_manager.run_inline.assert_awaited_once_with(
+        task="Hard question",
+        model="powerful/model",
+        temperature=1.0,
+        max_tokens=16384,
     )
-    call_args = subagent_manager.spawn.call_args
-    assert "Analyze this data" in call_args.kwargs["task"]
-    assert "some data here" in call_args.kwargs["task"]
 
 
 @pytest.mark.asyncio
 async def test_inline_missing_tier():
-    tool = ThinkTool(lm_quick=None, lm_deep=None)
+    mgr = AsyncMock()
+    tool = ThinkTool(subagent_manager=mgr, quick_config=None, deep_config=None)
     result = await tool.execute(prompt="test", mode="quick")
     assert "Error" in result
     assert "'quick' tier is not configured" in result
 
 
 @pytest.mark.asyncio
-async def test_inline_error_handling(full_tool):
-    with patch("dspy.context") as ctx_mock, \
-         patch("dspy.Predict") as predict_cls:
-        ctx_mock.return_value.__enter__ = MagicMock()
-        ctx_mock.return_value.__exit__ = MagicMock(return_value=False)
-        predict_cls.return_value.side_effect = RuntimeError("LLM down")
-
-        result = await full_tool.execute(prompt="test", mode="quick")
-
-    assert "Error in think(quick)" in result
-    assert "LLM down" in result
+async def test_no_subagent_manager():
+    tool = ThinkTool(subagent_manager=None)
+    result = await tool.execute(prompt="test", mode="quick")
+    assert "Error" in result
+    assert "not available" in result
 
 
 # -- background mode --
 
 @pytest.mark.asyncio
-async def test_background_delegates_to_subagent_manager(full_tool, subagent_manager):
+async def test_background_delegates_to_spawn(full_tool, subagent_manager):
     result = await full_tool.execute(
         prompt="Research topic X",
         mode="background",
@@ -188,14 +123,6 @@ async def test_background_uses_set_context(full_tool, subagent_manager):
         origin_channel="slack",
         origin_chat_id="C123:thread_456",
     )
-
-
-@pytest.mark.asyncio
-async def test_background_no_manager():
-    tool = ThinkTool(lm_quick=MagicMock(), lm_deep=MagicMock(), subagent_manager=None)
-    result = await tool.execute(prompt="test", mode="background")
-    assert "Error" in result
-    assert "not available" in result
 
 
 # -- registration in AgentLoop --
@@ -224,5 +151,4 @@ def test_think_tool_registered_in_agent_loop(tmp_path):
 
     assert agent.tools.get("think") is not None
     assert isinstance(agent.tools.get("think"), ThinkTool)
-    # spawn tool should no longer be registered
     assert agent.tools.get("spawn") is None

@@ -9,27 +9,27 @@ if TYPE_CHECKING:
 
 
 class ThinkTool(Tool):
-    """Delegate a subtask to a specific thinking mode, inline or in the background.
+    """Delegate a subtask to a specific thinking mode.
+
+    All modes run a full agent loop with tools (file, shell, web,
+    Confluence, Jira, etc.).  The difference is the model tier and
+    whether the task blocks or runs in the background.
 
     Modes:
-      - **quick** — fast/cheap single LLM call, inline. Good for
-        classification, reformatting, yes/no questions.
-      - **deep** — powerful single LLM call, inline. Good for hard
-        reasoning, self-reflection, evaluation.
-      - **background** — spawns a full subagent with tools that runs
-        asynchronously and reports back when done. Good for complex,
-        time-consuming tasks that can run independently.
+      - **quick** — synchronous, cheap/fast model.
+      - **deep** — synchronous, powerful model with extended reasoning.
+      - **background** — asynchronous, reports back when done.
     """
 
     def __init__(
         self,
-        lm_quick: Any = None,
-        lm_deep: Any = None,
         subagent_manager: "SubagentManager | None" = None,
+        quick_config: tuple[str, float, int] | None = None,
+        deep_config: tuple[str, float, int] | None = None,
     ):
-        self._lm_quick = lm_quick
-        self._lm_deep = lm_deep
         self._subagent_manager = subagent_manager
+        self._quick_config = quick_config  # (model, temperature, max_tokens)
+        self._deep_config = deep_config
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
 
@@ -46,15 +46,11 @@ class ThinkTool(Tool):
     def description(self) -> str:
         return (
             "Delegate a subtask to a different thinking mode. "
-            "'quick' = fast/cheap inline call for trivial mechanical subtasks ONLY "
-            "(e.g. 'is X a valid email?', 'extract the date from this string'). "
-            "Do NOT use quick for summarisation or analysis — you can do that yourself. "
-            "'deep' = powerful inline call for hard problems, self-reflection, or when you are stuck. "
-            "'background' = spawn a full subagent with tools that runs asynchronously "
-            "and reports back — use for complex tasks that can run independently. "
-            "IMPORTANT: For quick/deep modes, the LLM only sees 'prompt' and 'context'. "
-            "You MUST paste any relevant data into 'context'. "
-            "If you already have the answer in your trajectory, do NOT call this tool."
+            "All modes have full tool access (files, shell, web, Jira, Confluence). "
+            "'quick' = fast/cheap model, synchronous — use for simple subtasks. "
+            "'deep' = powerful model, synchronous — use for hard problems or when stuck. "
+            "'background' = runs asynchronously and reports back — use for "
+            "time-consuming research or multi-step investigations."
         )
 
     @property
@@ -64,28 +60,20 @@ class ThinkTool(Tool):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "The task or question to think about",
-                },
-                "context": {
-                    "type": "string",
-                    "description": (
-                        "Data the LLM needs to answer the prompt (e.g. page content, "
-                        "file contents, previous tool output). Required for quick/deep — "
-                        "the inline LLM has NO access to conversation history or tools."
-                    ),
+                    "description": "The task to accomplish. Be specific and self-contained.",
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["quick", "deep", "background"],
                     "description": (
-                        "quick = fast/cheap inline call. "
-                        "deep = slow/powerful inline call. "
-                        "background = full subagent with tools, runs async."
+                        "quick = fast/cheap model, blocks until done. "
+                        "deep = powerful model, blocks until done. "
+                        "background = runs async, reports back later."
                     ),
                 },
                 "label": {
                     "type": "string",
-                    "description": "Short label for the task (used in background mode for display)",
+                    "description": "Short label for the task (used for display/logging)",
                 },
             },
             "required": ["prompt", "mode"],
@@ -95,43 +83,28 @@ class ThinkTool(Tool):
         self,
         prompt: str,
         mode: str = "quick",
-        context: str | None = None,
         label: str | None = None,
         **kwargs: Any,
     ) -> str:
+        if self._subagent_manager is None:
+            return "Error: think tool is not available (no subagent manager)."
+
         if mode == "background":
-            full_task = f"{prompt}\n\nContext:\n{context}" if context else prompt
-            return await self._run_background(full_task, label)
-        return await self._run_inline(prompt, context, mode)
+            return await self._subagent_manager.spawn(
+                task=prompt,
+                label=label,
+                origin_channel=self._origin_channel,
+                origin_chat_id=self._origin_chat_id,
+            )
 
-    async def _run_inline(self, prompt: str, context: str | None, mode: str) -> str:
-        """Single dspy.Predict call on the chosen tier."""
-        import dspy
-
-        lm = self._lm_quick if mode == "quick" else self._lm_deep
-        if lm is None:
+        config = self._quick_config if mode == "quick" else self._deep_config
+        if config is None:
             return f"Error: '{mode}' tier is not configured."
 
-        try:
-            with dspy.context(lm=lm):
-                if context:
-                    result = dspy.Predict("context, prompt -> result")(
-                        context=context, prompt=prompt,
-                    )
-                else:
-                    result = dspy.Predict("prompt -> result")(prompt=prompt)
-            return result.result
-        except Exception as e:
-            return f"Error in think({mode}): {e}"
-
-    async def _run_background(self, task: str, label: str | None) -> str:
-        """Spawn a full subagent to handle the task asynchronously."""
-        if self._subagent_manager is None:
-            return "Error: background mode is not available (no subagent manager)."
-
-        return await self._subagent_manager.spawn(
-            task=task,
-            label=label,
-            origin_channel=self._origin_channel,
-            origin_chat_id=self._origin_chat_id,
+        model, temperature, max_tokens = config
+        return await self._subagent_manager.run_inline(
+            task=prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )

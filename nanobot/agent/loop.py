@@ -107,11 +107,21 @@ class AgentLoop:
         self._react_agent: Any = None  # Lazy-initialised after MCP connect
         self._register_default_tools()
 
-        # Think tool — inline tier calls + background subagents
+        # Think tool — all modes run a full agent loop with tools
+        quick_cfg = None
+        deep_cfg = None
+        if self.agent_defaults:
+            for tier_name, cfg_attr in [("quick", "quick_cfg"), ("deep", "deep_cfg")]:
+                m, t, mt = self.agent_defaults.resolve_tier(tier_name)
+                if m != self.model:
+                    if tier_name == "quick":
+                        quick_cfg = (m, t, mt)
+                    else:
+                        deep_cfg = (m, t, mt)
         self.tools.register(ThinkTool(
-            lm_quick=self.lm_quick,
-            lm_deep=self.lm_deep,
             subagent_manager=self.subagents,
+            quick_config=quick_cfg,
+            deep_config=deep_cfg,
         ))
     
     def _register_default_tools(self) -> None:
