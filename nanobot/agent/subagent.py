@@ -97,10 +97,12 @@ class SubagentManager:
         temperature: float | None = None,
         max_tokens: int | None = None,
         max_iterations: int = 15,
+        parent_span: Any = None,
     ) -> str:
         """Core agent loop: chat with tools until the LLM produces a final answer.
 
         Used by both ``spawn`` (background) and ``run_inline`` (synchronous).
+        ``parent_span`` is an optional MLflow LiveSpan for nesting child spans.
         """
         tools = self._build_tools()
         system_prompt = self._build_subagent_prompt(task)
@@ -114,9 +116,18 @@ class SubagentManager:
         use_max = max_tokens if max_tokens is not None else self.max_tokens
 
         for iteration in range(1, max_iterations + 1):
-            response = await self._traced_chat(
-                tag, iteration, messages, tools, use_model, use_temp, use_max,
+            chat_span = self._start_child_span(
+                f"subagent.chat", parent_span,
+                attributes={"tag": tag, "iteration": iteration, "model": use_model},
             )
+            try:
+                response = await self.provider.chat(
+                    messages=messages, tools=tools.get_definitions(),
+                    model=use_model, temperature=use_temp, max_tokens=use_max,
+                )
+            finally:
+                if chat_span:
+                    chat_span.end()
 
             if not response.has_tool_calls:
                 return response.content or "Task completed but no final response was generated."
@@ -139,9 +150,18 @@ class SubagentManager:
             })
 
             for tool_call in response.tool_calls:
-                result = await self._traced_tool(
-                    tag, tools, tool_call.name, tool_call.arguments, tool_call.id,
+                logger.debug(f"[{tag}] executing: {tool_call.name}")
+                tool_span = self._start_child_span(
+                    f"subagent.tool.{tool_call.name}", parent_span,
+                    attributes={"tag": tag, "tool": tool_call.name,
+                                "args": json.dumps(tool_call.arguments)[:500]},
                 )
+                try:
+                    result = await tools.execute(tool_call.name, tool_call.arguments)
+                finally:
+                    if tool_span:
+                        tool_span.set_outputs({"result_preview": result[:300]})
+                        tool_span.end()
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -151,39 +171,21 @@ class SubagentManager:
 
         return "Task completed but no final response was generated."
 
-    async def _traced_chat(
-        self, tag: str, iteration: int,
-        messages: list, tools: ToolRegistry,
-        model: str, temperature: float, max_tokens: int,
-    ) -> LLMResponse:
-        """LLM call with optional MLflow span."""
-        if self._mlflow:
-            with self._mlflow.start_span(
-                name=f"subagent.chat",
-                attributes={"tag": tag, "iteration": iteration, "model": model},
-            ):
-                return await self.provider.chat(
-                    messages=messages, tools=tools.get_definitions(),
-                    model=model, temperature=temperature, max_tokens=max_tokens,
-                )
-        return await self.provider.chat(
-            messages=messages, tools=tools.get_definitions(),
-            model=model, temperature=temperature, max_tokens=max_tokens,
-        )
+    def _start_child_span(
+        self, name: str, parent_span: Any = None, **kwargs: Any
+    ) -> Any:
+        """Create a child span under ``parent_span`` using the no-context API.
 
-    async def _traced_tool(
-        self, tag: str, tools: ToolRegistry,
-        tool_name: str, tool_args: dict, tool_call_id: str,
-    ) -> str:
-        """Tool execution with optional MLflow span."""
-        logger.debug(f"[{tag}] executing: {tool_name}")
-        if self._mlflow:
-            with self._mlflow.start_span(
-                name=f"subagent.tool.{tool_name}",
-                attributes={"tag": tag, "tool": tool_name, "args": json.dumps(tool_args)[:500]},
-            ):
-                return await tools.execute(tool_name, tool_args)
-        return await tools.execute(tool_name, tool_args)
+        Returns the LiveSpan, or None if MLflow is not available.
+        """
+        if not self._mlflow:
+            return None
+        try:
+            return self._mlflow.start_span_no_context(
+                name=name, parent_span=parent_span, **kwargs,
+            )
+        except Exception:
+            return None
 
     # -- public entry points -------------------------------------------------
 
@@ -200,24 +202,23 @@ class SubagentManager:
         """
         tag = f"inline-{str(uuid.uuid4())[:6]}"
         logger.info(f"[{tag}] starting inline task: {task[:60]}...")
+        root = self._start_child_span(
+            "think.inline", parent_span=None,
+            attributes={"tag": tag, "model": model or self.model,
+                        "task_preview": task[:200]},
+        )
         try:
-            if self._mlflow:
-                with self._mlflow.start_span(
-                    name="think.inline",
-                    attributes={"tag": tag, "model": model or self.model,
-                                "task_preview": task[:200]},
-                ):
-                    return await self._run_task_loop(
-                        task, tag, model=model, temperature=temperature,
-                        max_tokens=max_tokens, max_iterations=10,
-                    )
             return await self._run_task_loop(
                 task, tag, model=model, temperature=temperature,
                 max_tokens=max_tokens, max_iterations=10,
+                parent_span=root,
             )
         except Exception as e:
             logger.error(f"[{tag}] failed: {e}")
             return f"Error: {e}"
+        finally:
+            if root:
+                root.end()
 
     async def spawn(
         self,
@@ -248,22 +249,23 @@ class SubagentManager:
         """Background wrapper: runs the loop and announces the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         tag = f"bg-{task_id}"
+        root = self._start_child_span(
+            "think.background", parent_span=None,
+            attributes={"tag": tag, "label": label, "task_preview": task[:200]},
+        )
         try:
-            if self._mlflow:
-                with self._mlflow.start_span(
-                    name="think.background",
-                    attributes={"tag": tag, "label": label,
-                                "task_preview": task[:200]},
-                ):
-                    result = await self._run_task_loop(task, tag=tag)
-            else:
-                result = await self._run_task_loop(task, tag=tag)
+            result = await self._run_task_loop(task, tag=tag, parent_span=root)
             logger.info(f"Subagent [{task_id}] completed successfully")
+            if root:
+                root.set_outputs({"result_preview": result[:500]})
             await self._announce_result(task_id, label, task, result, origin, "ok")
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error(f"Subagent [{task_id}] failed: {e}")
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
+        finally:
+            if root:
+                root.end()
 
     async def _announce_result(
         self,
