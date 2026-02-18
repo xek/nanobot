@@ -618,7 +618,14 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+
+        routed_msg = InboundMessage(
+            channel=origin_channel,
+            sender_id=msg.sender_id,
+            chat_id=origin_chat_id,
+            content=msg.content,
+        )
+        final_content, _, _ = await self._traced_agent_loop(initial_messages, routed_msg)
 
         if final_content is None:
             final_content = "Background task completed."
