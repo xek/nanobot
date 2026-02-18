@@ -281,6 +281,13 @@ class AgentLoop:
             self._tracer = trace.get_tracer("nanobot")
             self.subagents.set_tracer(self._tracer)
 
+            try:
+                import litellm
+                litellm.callbacks = ["otel"]
+                logger.info("litellm OTel callback enabled")
+            except Exception as cb_err:
+                logger.debug(f"Could not enable litellm OTel callback: {cb_err}")
+
             logger.info(f"OpenTelemetry tracing enabled → {endpoint}")
         except ImportError:
             self._tracer = None
@@ -337,6 +344,7 @@ class AgentLoop:
 
     async def _traced_agent_loop(
         self, initial_messages: list[dict], msg: InboundMessage,
+        turn_type: str = "user",
     ) -> tuple[str | None, list[str], dict[str, dict]]:
         """Run the agent loop with optional DSPy usage tracking and OTel span."""
         usage_totals: dict[str, dict] = {}
@@ -352,13 +360,17 @@ class AgentLoop:
                 with self._tracer.start_as_current_span(
                     "agent_turn",
                     attributes={
+                        "turn_type": turn_type,
                         "channel": msg.channel,
                         "chat_id": msg.chat_id,
                         "sender": msg.sender_id,
-                        "message_preview": msg.content[:120],
+                        "message_preview": msg.content[:200],
                     },
-                ):
+                ) as span:
                     content, tools = await self._run_agent_loop(initial_messages)
+                    if span.is_recording():
+                        span.set_attribute("response_preview", (content or "")[:500])
+                        span.set_attribute("tools_used", tools)
             else:
                 content, tools = await self._run_agent_loop(initial_messages)
         usage_totals = tracker.get_total_tokens()
@@ -625,7 +637,9 @@ class AgentLoop:
             chat_id=origin_chat_id,
             content=msg.content,
         )
-        final_content, _, _ = await self._traced_agent_loop(initial_messages, routed_msg)
+        final_content, _, _ = await self._traced_agent_loop(
+            initial_messages, routed_msg, turn_type="system",
+        )
 
         if final_content is None:
             final_content = "Background task completed."

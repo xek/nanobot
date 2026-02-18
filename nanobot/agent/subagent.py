@@ -115,11 +115,15 @@ class SubagentManager:
         use_max = max_tokens if max_tokens is not None else self.max_tokens
 
         for iteration in range(1, max_iterations + 1):
-            with self._span("llm", attributes={"iteration": iteration, "model": use_model}):
+            with self._span("llm", attributes={"iteration": iteration, "model": use_model}) as span:
                 response = await self.provider.chat(
                     messages=messages, tools=tools.get_definitions(),
                     model=use_model, temperature=use_temp, max_tokens=use_max,
                 )
+                if span and span.is_recording():
+                    span.set_attribute("response_preview", (response.content or "")[:500])
+                    if response.has_tool_calls:
+                        span.set_attribute("tool_calls", [tc.name for tc in response.tool_calls])
 
             if not response.has_tool_calls:
                 return response.content or "Task completed but no final response was generated."
@@ -146,8 +150,10 @@ class SubagentManager:
                 with self._span(
                     f"tool.{tool_call.name}",
                     attributes={"args": json.dumps(tool_call.arguments)[:500]},
-                ):
+                ) as tspan:
                     result = await tools.execute(tool_call.name, tool_call.arguments)
+                    if tspan and tspan.is_recording():
+                        tspan.set_attribute("result_preview", result[:500])
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -170,12 +176,16 @@ class SubagentManager:
 
     @contextmanager
     def _span(self, name: str, attributes: dict | None = None):
-        """Start an OTel span as a child of the current context, or no-op."""
+        """Start an OTel span as a child of the current context, or no-op.
+
+        Yields the span object (or ``None``) so callers can record
+        additional attributes after the work is done.
+        """
         if self._tracer:
-            with self._tracer.start_as_current_span(name, attributes=attributes):
-                yield
+            with self._tracer.start_as_current_span(name, attributes=attributes) as span:
+                yield span
         else:
-            yield
+            yield None
 
     # -- public entry points -------------------------------------------------
 
