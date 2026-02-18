@@ -288,6 +288,7 @@ class AgentLoop:
         self._mcp_stack = AsyncExitStack()
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+        self.subagents.set_shared_tools(self.tools)
 
     def _set_tool_context(self, channel: str, chat_id: str) -> None:
         """Update context for all tools that need routing info."""

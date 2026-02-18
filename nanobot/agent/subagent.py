@@ -49,6 +49,21 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._shared_tools: list[Any] = []
+
+    def set_shared_tools(self, parent_registry: "ToolRegistry") -> None:
+        """Copy MCP and other shared tools from the parent agent's registry.
+
+        Called after MCP servers are connected so the subagent can use
+        Confluence, Jira, etc.  Tools that should stay private to the
+        main agent (message, think, cron) are excluded.
+        """
+        from nanobot.agent.tools.mcp import MCPToolWrapper
+        exclude = {"message", "think", "cron"}
+        self._shared_tools = [
+            tool for name, tool in parent_registry._tools.items()
+            if name not in exclude and isinstance(tool, MCPToolWrapper)
+        ]
     
     async def spawn(
         self,
@@ -100,7 +115,6 @@ class SubagentManager:
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         
         try:
-            # Build subagent tools (no message tool, no think tool)
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(allowed_dir=allowed_dir))
@@ -114,6 +128,8 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
+            for shared_tool in self._shared_tools:
+                tools.register(shared_tool)
             
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)
@@ -239,6 +255,7 @@ You are a subagent spawned by the main agent to complete a specific task.
 - Read and write files in the workspace
 - Execute shell commands
 - Search the web and fetch web pages
+- Use Jira and Confluence tools (if available)
 - Complete the task thoroughly
 
 ## What You Cannot Do
